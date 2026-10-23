@@ -28,3 +28,8 @@ Desktop.ini
 # Other legacy PCB designs, libraries, scripts and evidence stay visible.
 /hardware/pcb/legacy/easyeda-mcp/
 /hardware/pcb/legacy/pro-api-sdk/
+
+# MP6 local-only material: recovered MotSim sources, agent scratch work, local settings
+/motum_resources/
+/.mp6-work/
+/stewart_settings.json

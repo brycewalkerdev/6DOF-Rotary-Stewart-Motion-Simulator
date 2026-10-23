@@ -197,6 +197,17 @@ The app creates `stewart_settings.json` and `stewart_imgui.ini` in the working d
 cmake --build build --config Release
 ```
 
+### Running the offline checks
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure
+```
+
+This runs the recording, documentation-mode guard, MP6 protocol codec
+(`mp6_protocol_codec`) and MP6 session lifecycle (`mp6_session_lifecycle`,
+forced into documentation mode) test suites. See [MP6 backend](MP6.md) for
+what the MP6 suites cover.
+
 ### Fresh Build After Moving the Checkout
 
 From `app/`, configure a new directory so earlier caches and outputs stay available:

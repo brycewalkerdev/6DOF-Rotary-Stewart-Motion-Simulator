@@ -130,7 +130,7 @@ dimensions and calibration.
 The native C++/OpenGL/ImGui app is both a simulator and a development workbench:
 
 - **3D platform views** with servo-angle readouts and editable geometry.
-- **Independent entities** for software-in-the-loop (SIL) experiments and hardware-in-the-loop (HIL) development.
+- **Independent entities** for software-in-the-loop (SIL) experiments and hardware-in-the-loop (HIL) development (ESP32 COBS backend, plus the Motum Mega [MP6 backend](docs/MP6.md)).
 - **Motion cueing and filtering** with per-axis controls and frequency-response views.
 - **Input plugins** for Assetto Corsa, SimTools, manual controls and test signals.
 - **Recording and playback**, time-series plots, spectrograms and diagnostic logs.

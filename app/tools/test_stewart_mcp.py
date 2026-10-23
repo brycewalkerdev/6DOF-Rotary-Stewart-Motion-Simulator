@@ -128,8 +128,51 @@ class LifecycleTests(unittest.TestCase):
         tools = asyncio.run(bridge.mcp.list_tools())
         by_name = {tool.name: tool for tool in tools}
         self.assertTrue(by_name["stewart_launch"].inputSchema["properties"]["documentation_mode"]["default"])
-        for name in ["stewart_ui_get", "stewart_ui_set", "stewart_docs_fixture", "stewart_screenshot", "stewart_wait_frames", "stewart_capabilities"]:
+        for name in ["stewart_ui_get", "stewart_ui_set", "stewart_docs_fixture", "stewart_screenshot", "stewart_wait_frames", "stewart_capabilities",
+                     "stewart_mp6_status", "stewart_mp6_connect", "stewart_mp6_disconnect", "stewart_mp6_command", "stewart_mp6_config_import", "stewart_mp6_controller_settings"]:
             self.assertIn(name, by_name)
+
+    def test_mp6_wrappers_and_add_entity_backend(self):
+        with patch.object(bridge, "_call", return_value={}) as call:
+            bridge.stewart_add_entity("MP6 rig", "HIL", "mp6")
+            self.assertEqual(call.call_args.args,
+                             ("entity_add", {"name": "MP6 rig", "type": "HIL", "backend": "mp6"}))
+            bridge.stewart_mp6_status(3)
+            self.assertEqual(call.call_args.args, ("mp6_status", {"entity": 3}))
+            bridge.stewart_mp6_connect(None, "COM7")
+            self.assertEqual(call.call_args.args, ("mp6_connect", {"port": "COM7"}))
+            bridge.stewart_mp6_disconnect(3)
+            self.assertEqual(call.call_args.args, ("mp6_disconnect", {"entity": 3}))
+            bridge.stewart_mp6_command(3, "configure")
+            self.assertEqual(call.call_args.args, ("mp6_command", {"entity": 3, "intent": "configure"}))
+            bridge.stewart_mp6_command(3, "shutdown")
+            self.assertEqual(call.call_args.args, ("mp6_command", {"entity": 3, "intent": "shutdown"}))
+            bridge.stewart_mp6_config_import(3, "Step/Rev\tv")
+            self.assertEqual(call.call_args.args, ("mp6_config_import", {"entity": 3, "text": "Step/Rev\tv"}))
+            bridge.stewart_mp6_controller_settings(3, pid_index=0, comms_timeout_ms=1000, pressure_aim_psi=30)
+            self.assertEqual(call.call_args.args,
+                             ("mp6_controller_settings", {"entity": 3, "pid_index": 0, "comms_timeout_ms": 1000, "pressure_aim_psi": 30}))
+        with self.assertRaises(ValueError):
+            bridge.stewart_add_entity("x", "SIL", "cobol")
+
+    def test_mp6_start_settings_and_known_state_recovery(self):
+        # Wrapper framing only; production dispatch is covered by the C++ App suite.
+        with patch.object(bridge, "_call", return_value={}) as call:
+            bridge.stewart_mp6_controller_settings(3, sensor_filter_start=.0234,
+                history_len_start=9, pressure_aim_supplied=True)
+            self.assertEqual(call.call_args.args, ("mp6_controller_settings", {
+                "entity": 3, "sensor_filter_start": .0234, "history_len_start": 9,
+                "pressure_aim_supplied": True}))
+            bridge.stewart_mp6_recover_known_state(3, True)
+            self.assertEqual(call.call_args.args, ("mp6_recover_known_state", {
+                "entity": 3, "physical_state_confirmed": True}))
+
+    def test_multi_entity_targeting(self):
+        with patch.object(bridge, "_call", return_value={}) as call:
+            bridge.stewart_mp6_status(1)
+            self.assertEqual(call.call_args.args, ("mp6_status", {"entity": 1}))
+            bridge.stewart_mp6_command(2, "start")
+            self.assertEqual(call.call_args.args, ("mp6_command", {"entity": 2, "intent": "start"}))
 
 
 class WrapperTests(unittest.TestCase):

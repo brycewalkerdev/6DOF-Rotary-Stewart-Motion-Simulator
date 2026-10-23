@@ -202,10 +202,17 @@ void DrawPlatformViz(ImDrawList* dl, ImVec2 origin, ImVec2 size,
     // ── Auto-init camera distance ──
     if (cam.distance <= 0.0f) {
         float max_r = 1.0f;
-        for (int k = 0; k < 6; k++) {
-            float r = sqrtf(plat.actuators[k].base_pos[0] * plat.actuators[k].base_pos[0] +
-                            plat.actuators[k].base_pos[1] * plat.actuators[k].base_pos[1]);
-            if (r > max_r) max_r = r;
+        // MP6 has no ESP32 actuator chain; frame the explicitly supplied
+        // design radius (never the reference rig's numbers).
+        if (e.type == EntityType::HIL && e.hil_backend == HilBackend::MP6) {
+            max_r = e.mp6.design.bot_b_mm > 1.0f ? e.mp6.design.bot_b_mm
+                  : (e.mp6.design.base_radius_mm > 1.0f ? e.mp6.design.base_radius_mm : 250.0f);
+        } else {
+            for (int k = 0; k < 6; k++) {
+                float r = sqrtf(plat.actuators[k].base_pos[0] * plat.actuators[k].base_pos[0] +
+                                plat.actuators[k].base_pos[1] * plat.actuators[k].base_pos[1]);
+                if (r > max_r) max_r = r;
+            }
         }
         cam.distance = max_r * 4.5f;
     }
@@ -227,6 +234,16 @@ void DrawPlatformViz(ImDrawList* dl, ImVec2 origin, ImVec2 size,
 
     // ── Build camera ──
     Vec3 target = {0, 0, home_h * 0.45f};
+    if (e.type == EntityType::HIL && e.hil_backend == HilBackend::MP6) {
+        // Frame the actual MP6 world: base plane is z=0, top plate height is
+        // whatever the solver produced (falls back to the design radius as a
+        // neutral stand-in when no solve has run yet).
+        float top_z_seen = 0.0f;
+        for (int k = 0; k < 6; k++) top_z_seen = fmaxf(top_z_seen, e.mp6.viz.rod_top[k][2]);
+        if (top_z_seen <= 0.0f)
+            top_z_seen = e.mp6.design.bot_b_mm > 1.0f ? e.mp6.design.bot_b_mm : 250.0f;
+        target = {0, 0, top_z_seen * 0.45f};
+    }
     Camera3D camera = buildCamera(target, cam.azimuth, cam.elevation, cam.distance);
 
     ImVec2 center = ImVec2(origin.x + size.x * 0.5f, origin.y + size.y * 0.5f);
@@ -241,10 +258,15 @@ void DrawPlatformViz(ImDrawList* dl, ImVec2 origin, ImVec2 size,
 
     // ── Grid floor (z = 0) ──
     float max_base_r = 1.0f;
-    for (int k = 0; k < 6; k++) {
-        float r = sqrtf(plat.actuators[k].base_pos[0] * plat.actuators[k].base_pos[0] +
-                        plat.actuators[k].base_pos[1] * plat.actuators[k].base_pos[1]);
-        if (r > max_base_r) max_base_r = r;
+    if (e.type == EntityType::HIL && e.hil_backend == HilBackend::MP6) {
+        max_base_r = e.mp6.design.bot_b_mm > 1.0f ? e.mp6.design.bot_b_mm
+                   : (e.mp6.design.base_radius_mm > 1.0f ? e.mp6.design.base_radius_mm : 250.0f);
+    } else {
+        for (int k = 0; k < 6; k++) {
+            float r = sqrtf(plat.actuators[k].base_pos[0] * plat.actuators[k].base_pos[0] +
+                            plat.actuators[k].base_pos[1] * plat.actuators[k].base_pos[1]);
+            if (r > max_base_r) max_base_r = r;
+        }
     }
     float grid_extent = ceilf(max_base_r / 50.0f) * 50.0f + 50.0f;
     float grid_step = 50.0f;
@@ -266,6 +288,180 @@ void DrawPlatformViz(ImDrawList* dl, ImVec2 origin, ImVec2 size,
     dl->AddLine(o2, project(v3(ax_len,0,0), camera, center, half_h), IM_COL32(200,60,60,140), 1.0f);
     dl->AddLine(o2, project(v3(0,ax_len,0), camera, center, half_h), IM_COL32(60,200,60,140), 1.0f);
     dl->AddLine(o2, project(v3(0,0,ax_len), camera, center, half_h), IM_COL32(60,60,200,140), 1.0f);
+
+    // ── MP6 (rotary Stewart) pose path ─────────────────────────────────
+    //
+    // No generic servo-FK is run on MP6 data: the rotary crank drive train has
+    // no servo-arm chain in this app's actuator model, and inventing a chain
+    // would fabricate joint positions the geometry module has not provided.
+    // Drawn instead:
+    //   * the two hexagon plates, from the explicitly supplied design radii,
+    //     never from the reference rig or the ESP32 actuator chain;
+    //   * only the pose the app can actually name: the measured feedback pose
+    //     (green) or the modelled target pose (amber) — the two are never
+    //     conflated, and "model" never claims to be feedback.
+    if (e.type == EntityType::HIL && e.hil_backend == HilBackend::MP6) {
+        // Depth line batch for this branch only (declared ahead of the shared
+        // path; the block returns early before the servo-model code runs).
+        std::vector<DepthLine> lines;
+        lines.reserve(40);
+        ImU32 base_col = IM_COL32(70, 80, 100, 200);
+        ImVec4 ecol(e.color[0], e.color[1], e.color[2], 1.0f);
+        ImU32 plat_col = IM_COL32((int)(ecol.x*220), (int)(ecol.y*220), (int)(ecol.z*220), 230);
+        bool have_pose = e.mp6.feedback_pose_valid || e.mp6.target_pose_valid;
+        const float* pose = e.mp6.feedback_pose_valid ? e.mp6.feedback_pose
+                                                      : e.mp6.target_pose;
+        bool have_radii = e.mp6.design.bot_b_mm > 1.0f
+            ? (e.mp6.design.top_b_mm > 1.0f)
+            : (e.mp6.design.base_radius_mm > 1.0f
+               && e.mp6.design.platform_radius_mm > 1.0f);
+        float bot_b = e.mp6.design.bot_b_mm > 1.0f ? e.mp6.design.bot_b_mm
+                      : e.mp6.design.base_radius_mm;
+        float top_b = e.mp6.design.bot_b_mm > 1.0f ? e.mp6.design.top_b_mm
+                      : e.mp6.design.platform_radius_mm;
+        ImU32 crank_col = IM_COL32(200, 150, 60, 210);
+        ImU32 rod_bad_col = IM_COL32(200, 70, 60, 170);
+
+        // Decorative plate X-center follows the effective world X offset: the
+        // design entry by default, but the solver's own base-pivot frame wins
+        // when a solve has run (pltc X-Offset overrides the design value, so
+        // the recorded pivots carry the effective offset).
+        float deco_x = e.mp6.design.off_x_mm;   // legacy fallback handled below
+        if (deco_x == 0.0f) deco_x = e.mp6.design.x_offset_mm;
+        if (e.mp6.viz.solver_ready) {
+            float xs = 0.0f;
+            int n = 0;
+            for (int k = 0; k < 6; k++) {
+                if (e.mp6.viz.base_pivot[k][0] != 0.0f || e.mp6.viz.base_pivot[k][1] != 0.0f) {
+                    xs += e.mp6.viz.base_pivot[k][0];
+                    n++;
+                }
+            }
+            if (n == 6) deco_x = xs / (float)n;
+        }
+
+        if (have_radii) {
+            auto add3 = [&](Vec3 a3, Vec3 b3, ImU32 col, float th, Vec3 mid3) {
+                lines.push_back({ project(a3, camera, center, half_h),
+                                  project(b3, camera, center, half_h),
+                                  col, th, camDepth(mid3, camera) });
+            };
+            // Base hexagon (fixed): vertices at 60° steps at BotB, centered on
+            // the design X offset. Azimuth arrangement of the real fixture is
+            // not claimed anywhere in this view.
+            Vec3 hp[6];
+            for (int k = 0; k < 6; k++) {
+                float a = k * (float)M_PI / 3.0f;
+                hp[k] = v3(deco_x + bot_b * cosf(a), bot_b * sinf(a), 0.0f);
+            }
+            for (int k = 0; k < 6; k++)
+                add3(hp[k], hp[(k + 1) % 6], base_col, 1.5f,
+                     v3((hp[k].x + hp[(k + 1) % 6].x) * 0.5f,
+                        (hp[k].y + hp[(k + 1) % 6].y) * 0.5f, 0.0f));
+
+            if (have_pose) {
+                // R = Rz(yaw) * Ry(pitch) * Rx(roll) applied to the platform
+                // hexagon, then translated by the pose translation.
+                float roll = pose[3], pitch = pose[4], yaw = pose[5];
+                float cy = cosf(yaw), sy = sinf(yaw);
+                float cp = cosf(pitch), sp = sinf(pitch);
+                float cr = cosf(roll), sr = sinf(roll);
+                auto xform = [&](float px, float py, float pz) -> Vec3 {
+                    float rx = cy*cp*px + (cy*sp*sr - sy*cr)*py + (cy*sp*cr + sy*sr)*pz;
+                    float ry = sy*cp*px + (sy*sp*sr + cy*cr)*py + (sy*sp*cr - cy*sr)*pz;
+                    float rz = -sp*px + cp*sr*py + cp*cr*pz;
+                    return v3(deco_x + pose[0] + rx, pose[1] + ry, pose[2] + rz);
+                };
+                Vec3 tp[6];
+                for (int k = 0; k < 6; k++) {
+                    float a = k * (float)M_PI / 3.0f;
+                    tp[k] = xform(top_b * cosf(a), top_b * sinf(a), 0.0f);
+                }
+                for (int k = 0; k < 6; k++)
+                    add3(tp[k], tp[(k + 1) % 6], plat_col, 2.0f,
+                         v3((tp[k].x + tp[(k + 1) % 6].x) * 0.5f,
+                            (tp[k].y + tp[(k + 1) % 6].y) * 0.5f,
+                            (tp[k].z + tp[(k + 1) % 6].z) * 0.5f));
+                Vec3 tc = xform(0, 0, 0);
+                ImVec2 pc6 = project(tc, camera, center, half_h);
+                dl->AddCircle(pc6, 5.0f, plat_col, 12, 1.5f);
+            }
+
+            // Rotary crank chain — drawn only from the solver's own recorded
+            // joints (crank rotation axes, crank ends, transformed top
+            // attachments). Nothing here invents or rescales a joint
+            // placement; a fresh solve owns rod_lines_valid.
+            if (e.mp6.viz.solver_ready) {
+                for (int k = 0; k < 6; k++) {
+                    Vec3 piv = v3(e.mp6.viz.base_pivot[k][0], e.mp6.viz.base_pivot[k][1],
+                                  e.mp6.viz.base_pivot[k][2]);
+                    Vec3 crk = v3(e.mp6.viz.crank_joint[k][0], e.mp6.viz.crank_joint[k][1],
+                                  e.mp6.viz.crank_joint[k][2]);
+                    Vec3 top = v3(e.mp6.viz.rod_top[k][0], e.mp6.viz.rod_top[k][1],
+                                  e.mp6.viz.rod_top[k][2]);
+                    bool alive = e.mp6.viz.crank_joint[k][0] != 0.0f
+                              || e.mp6.viz.crank_joint[k][1] != 0.0f
+                              || e.mp6.viz.crank_joint[k][2] != 0.0f;
+                    if (alive)
+                        add3(piv, crk, crank_col, 3.0f, crk);   // crank (driving link)
+                    // Rod (driven link): green-classed when the solver's own
+                    // RodCalcOK held; dim red when the axis failed the check —
+                    // the failure stays visible, never hidden.
+                    add3(crk, top,
+                         e.mp6.viz.axis_ok[k] ? plat_col : rod_bad_col,
+                         e.mp6.viz.axis_ok[k] ? 2.5f : 2.0f, top);
+                }
+            }
+
+            // Draw in one batch now (early return below skips the shared path)
+            std::sort(lines.begin(), lines.end(), [](const DepthLine& a, const DepthLine& b) {
+                return a.depth > b.depth;
+            });
+            for (auto& ln : lines) dl->AddLine(ln.a, ln.b, ln.col, ln.thickness);
+        }
+
+        // Labels
+        const char* mode_label;
+        ImU32 mode_col;
+        if (e.mp6.fault_latched) {
+            mode_label = "MP6 FAULT (TX suppressed)";
+            mode_col = IM_COL32(255, 70, 60, 255);
+        } else if (e.mp6.feedback_pose_valid) {
+            mode_label = "MP6 telemetry (measured pose)";
+            mode_col = IM_COL32(80, 200, 160, 200);
+        } else if (e.mp6.target_pose_valid) {
+            mode_label = "MP6 model (target pose only — measured feedback in I/O table)";
+            mode_col = IM_COL32(240, 190, 60, 200);
+        } else {
+            mode_label = "MP6 offline";
+            mode_col = IM_COL32(120, 120, 130, 160);
+        }
+        dl->AddText(ImVec2(origin.x + 4, origin.y + 2), mode_col, mode_label);
+        if (have_radii) {
+            char geo[128];
+            if (e.mp6.step_target_valid)
+                snprintf(geo, sizeof(geo), "BotB %.0f / TopB %.0f mm | StepAim streaming (onboard cmd 2)",
+                         bot_b, top_b);
+            else if (e.mp6.viz.solver_ready)
+                snprintf(geo, sizeof(geo), "BotB %.0f / TopB %.0f mm | solver ready; targets not fresh",
+                         bot_b, top_b);
+            else
+                snprintf(geo, sizeof(geo), "BotB %.0f / TopB %.0f mm | solver: see Platform tab",
+                         bot_b, top_b);
+            dl->AddText(ImVec2(origin.x + 4, origin.y + 16),
+                        IM_COL32(140, 140, 140, 180), geo);
+        } else {
+            dl->AddText(ImVec2(origin.x + 4, origin.y + 16),
+                        IM_COL32(255, 90, 70, 230),
+                        "design radii missing (explicit fields) - plates withheld");
+        }
+        if (hovered) {
+            dl->AddText(ImVec2(origin.x + size.x - 90, origin.y + size.y - 16),
+                        IM_COL32(70, 70, 70, 140), "drag to orbit");
+        }
+        dl->PopClipRect();
+        return;
+    }
 
     // ── Compute geometry ──
     bool hil_online = (e.type == EntityType::HIL) && e.serial && e.serial->isOpen();

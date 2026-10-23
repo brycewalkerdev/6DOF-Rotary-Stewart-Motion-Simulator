@@ -60,6 +60,12 @@ accepts newline-delimited JSON on localhost TCP; it queues commands for executio
 on the render thread. [`app/tools/stewart_mcp.py`](../app/tools/stewart_mcp.py)
 exposes that endpoint through MCP. Screenshots read the actual OpenGL framebuffer.
 
+The MP6 (Motum Mega rotary Stewart) backend is an additional, independent HIL
+path: `mp6_protocol/mp6_link/mp6_session` implement a second binary protocol,
+the session is the single TX owner, the UI stages intents only, and every COM
+open keeps the documentation-mode guard. Its lifecycle, configuration import
+and design-radius gating are described in [MP6 backend](MP6.md).
+
 ## Firmware output paths
 
 The full-size COBS path decodes `CH_DATA18` as six little-endian 24-bit values

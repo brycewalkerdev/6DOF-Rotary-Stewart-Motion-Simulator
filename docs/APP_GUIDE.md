@@ -99,6 +99,7 @@ An **entity** is an independent Stewart platform instance with its own geometry,
 - **When offline (ESP32 not connected):** the entity is idle — no IK computation, no animation. The 3D viewport shows the platform at its home position with an "OFFLINE" label.
 - **When connected with telemetry:** the 3D viewport shows the real platform pose driven by ESP32 telemetry angles.
 - Choose **Entity → Add HIL Entity** to add one
+- A second HIL backend exists for the Motum Mega rotary Stewart ("MP6") with its own raw-serial protocol, lifecycle and safely gated onboard-control mode; see [MP6 backend](MP6.md). It is selected per entity as `HIL · MP6` and never shares the COBS transport or settings of the ESP32 path.
 
 ### Entity Tabs
 

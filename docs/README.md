@@ -12,6 +12,7 @@ Shared build instructions, user guides and developer references live here.
 | [App guide](APP_GUIDE.md) | Desktop controls, entities, motion pipeline and recordings |
 | [App automation](APP_AUTOMATION.md) | Repository-local MCP setup, isolated documentation mode and real UI captures |
 | [Architecture](ARCHITECTURE.md) | Implemented software boundaries, data flow and shared kinematics |
+| [MP6 backend](MP6.md) | Motum Mega rotary Stewart HIL backend: scope, safety posture and control API |
 
 **The r13 PCB is untested. DO NOT ORDER.** Documentation and successful software
 builds do not establish safe drive-connected operation. Read the

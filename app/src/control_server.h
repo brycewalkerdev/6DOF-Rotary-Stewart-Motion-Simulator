@@ -33,3 +33,7 @@ extern ControlServer g_ctrl;
 // Reads the just-rendered back buffer into a PNG. Must be called on the
 // render thread with the GL context current (drain() satisfies this).
 bool CaptureWindowPNG(const char* path, int* out_w, int* out_h);
+
+#include <string>
+// Main-thread dispatcher shared by queued TCP requests and offline integration tests.
+std::string DispatchControlCommand(const std::string& line);

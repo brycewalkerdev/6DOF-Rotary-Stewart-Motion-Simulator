@@ -1,3 +1,4 @@
+#include <climits>
 /*
  * Control Server implementation — see control_server.h.
  */
@@ -94,9 +95,41 @@ const char* strarg(cJSON* a, const char* k, const char* def) {
     return (v && cJSON_IsString(v)) ? v->valuestring : def;
 }
 
+
+static Entity* resolve_mp6_entity(cJSON* a, std::string* err) {
+    cJSON* ej = a ? cJSON_GetObjectItem(a, "entity") : nullptr;
+    if (!ej) ej = a ? cJSON_GetObjectItem(a, "id") : nullptr;
+    if (ej) {
+        if (!cJSON_IsNumber(ej) || !std::isfinite(ej->valuedouble)
+            || ej->valuedouble < 0 || ej->valuedouble > INT_MAX
+            || std::floor(ej->valuedouble) != ej->valuedouble) {
+            if (err) *err = "entity must be a finite integral JSON number in [0, INT_MAX]";
+            return nullptr;
+        }
+        Entity* p = g_app.findEntity(ej->valueint);
+        if (!p) {
+            if (err) *err = "entity not found";
+            return nullptr;
+        }
+        if (p->type != EntityType::HIL || p->hil_backend != HilBackend::MP6) {
+            if (err) *err = "entity is not an MP6 HIL entity";
+            return nullptr;
+        }
+        return p;
+    }
+    // Genuinely omitted: pick first MP6 entity if any
+    for (auto& ent : g_app.entities) {
+        if (ent.type == EntityType::HIL && ent.hil_backend == HilBackend::MP6)
+            return &ent;
+    }
+    if (err) *err = "no MP6 HIL entity";
+    return nullptr;
+}
+
 Entity* pick_entity(cJSON* a) {
     if (g_app.entities.empty()) return nullptr;
     cJSON* e = a ? cJSON_GetObjectItem(a, "entity") : nullptr;
+    if (!e) e = a ? cJSON_GetObjectItem(a, "id") : nullptr;
     if (e && cJSON_IsNumber(e)) {
         Entity* p = g_app.findEntity(e->valueint);
         if (p) return p;
@@ -319,12 +352,24 @@ std::string handle(const std::string& line) {
     auto RESULT = [&](cJSON* r){ out = ok_resp(id, r); };
     auto ERR    = [&](const char* m){ out = err_resp(id, m); };
 
+    // Validate explicitly supplied MP6 targets even when the operation will
+    // later be refused by the documentation-mode transport policy.
+    if (!strncmp(cmd, "mp6_", 4) && a &&
+        (cJSON_GetObjectItem(a, "entity") || cJSON_GetObjectItem(a, "id"))) {
+        std::string why;
+        if (!resolve_mp6_entity(a, &why)) {
+            cJSON_Delete(root);
+            return err_resp(id, why.c_str());
+        }
+    }
+    // Import/settings only stage validated host inputs; they do not perform I/O.
     // Defense in depth: the transport layer also refuses hardware I/O in this
     // mode. Reject before creating a transport, queueing or changing state.
     const bool hardware_command = !strcmp(cmd, "hil_connect") ||
         !strcmp(cmd, "hil_stream_test") || !strcmp(cmd, "hil_command") ||
         !strcmp(cmd, "geometry_push") || !strcmp(cmd, "mca_push") ||
         !strcmp(cmd, "mca_save") ||
+        !strcmp(cmd, "mp6_connect") || !strcmp(cmd, "mp6_command") ||
         (!strcmp(cmd, "plugin") && !strcmp(strarg(a, "action", "list"), "activate"));
     if (IsDocumentationMode() && hardware_command) {
         cJSON_Delete(root);
@@ -356,7 +401,8 @@ std::string handle(const std::string& line) {
             "settings_save", "motion", "analyze", "export_sequence", "hil_command", "hil_status",
             "hil_raw_mode", "hil_tx_rate", "estop", "entity_enable", "record", "recording_delete",
             "recording_rename", "recordings_save", "geometry_get", "geometry_set", "geometry_push",
-            "mca_push", "mca_save", "console_rate", "quit"
+            "mca_push", "mca_save", "console_rate", "quit",
+            "mp6_status", "mp6_connect", "mp6_disconnect", "mp6_command", "mp6_config_import", "mp6_controller_settings", "mp6_recover_known_state"
         };
         cJSON* r = cJSON_CreateObject();
         cJSON_AddNumberToObject(r, "api", 2);
@@ -722,6 +768,8 @@ std::string handle(const std::string& line) {
             cJSON_AddNumberToObject(o, "id", e.id);
             cJSON_AddStringToObject(o, "name", e.name);
             cJSON_AddStringToObject(o, "type", e.type == EntityType::HIL ? "HIL" : "SIL");
+            cJSON_AddStringToObject(o, "backend",
+                e.hil_backend == HilBackend::MP6 ? "mp6" : "esp32");
             cJSON_AddBoolToObject(o, "enabled", e.enabled);
             cJSON_AddItemToArray(arr, o);
         }
@@ -731,11 +779,18 @@ std::string handle(const std::string& line) {
     }
     else if (!strcmp(cmd, "entity_add")) {
         const char* nm = strarg(a, "name", "Entity");
-        EntityType t = (strarg(a, "type", "SIL")[0] == 'H') ? EntityType::HIL : EntityType::SIL;
-        Entity& e = g_app.addEntity(nm, t);
-        cJSON* r = cJSON_CreateObject();
-        cJSON_AddNumberToObject(r, "id", e.id);
-        RESULT(r);
+        const char* be = strarg(a, "backend", "esp32");
+        if (strcmp(be, "esp32") != 0 && strcmp(be, "mp6") != 0) {
+            ERR("backend must be \"esp32\" (default) or \"mp6\"");
+        } else {
+            EntityType t = (strarg(a, "type", "SIL")[0] == 'H') ? EntityType::HIL : EntityType::SIL;
+            Entity& e = g_app.addEntity(nm, t,
+                (strcmp(be, "mp6") == 0) ? HilBackend::MP6 : HilBackend::ESP32);
+            cJSON* r = cJSON_CreateObject();
+            cJSON_AddNumberToObject(r, "id", e.id);
+            cJSON_AddStringToObject(r, "backend", be);
+            RESULT(r);
+        }
     }
     else if (!strcmp(cmd, "entity_remove")) {
         g_app.removeEntity((int)num(a, "id", -1));
@@ -747,6 +802,9 @@ std::string handle(const std::string& line) {
         // to the Linux bridge, with source/control over TCP. Runs on the render
         // thread (queued) exactly like the GUI, so it's thread-safe.
         Entity* e = pick_entity(a);
+        if (e && e->type == EntityType::HIL && e->hil_backend == HilBackend::MP6) {
+            ERR("entity is on the MP6 (Motum Mega) backend; use mp6_connect/mp6_command");
+        } else {
         if (!e || e->type != EntityType::HIL)
             e = &g_app.addEntity(strarg(a, "name", "Network HIL"), EntityType::HIL);
         snprintf(e->hil_host, sizeof(e->hil_host), "%s", strarg(a, "host", "192.168.1.168"));
@@ -775,6 +833,7 @@ std::string handle(const std::string& line) {
         cJSON_AddBoolToObject(r, "open", up->isOpen());
         cJSON_AddBoolToObject(r, "control_connected", up->controlConnected());
         RESULT(r);
+        } // end MP6-guard else
     }
     else if (!strcmp(cmd, "hil_stream_test")) {
         // Stream a live surge/sway/heave motion sweep straight through a
@@ -931,7 +990,12 @@ std::string handle(const std::string& line) {
         RESULT(nullptr);
     }
     else if (!strcmp(cmd, "motion")) {
-        g_app.motion_started = boolarg(a, "on", true);
+        bool on = boolarg(a, "on", true);
+        if (on) {
+            g_app.startMotion();
+        } else {
+            g_app.stopMotion();
+        }
         cJSON* r = cJSON_CreateObject();
         cJSON_AddBoolToObject(r, "motion_started", g_app.motion_started);
         RESULT(r);
@@ -1089,6 +1153,7 @@ std::string handle(const std::string& line) {
         Entity* e = pick_entity(a);
         const char* c = strarg(a, "command", nullptr);
         if (!e || e->type != EntityType::HIL) ERR("no HIL entity");
+        else if (e->hil_backend == HilBackend::MP6) ERR("entity is on the MP6 (Motum Mega) backend; there is no ASCII command channel — use mp6_command");
         else if (!e->serial || !e->serial->isOpen()) ERR("HIL not connected");
         else if (!c || !c[0]) ERR("missing command");
         else {
@@ -1106,6 +1171,7 @@ std::string handle(const std::string& line) {
         // Rich HIL link state (nothing else exposes handshake/raw-mode/tel).
         Entity* e = pick_entity(a);
         if (!e || e->type != EntityType::HIL) ERR("no HIL entity");
+        else if (e->hil_backend == HilBackend::MP6) ERR("entity is on the MP6 (Motum Mega) backend; use mp6_status");
         else {
             cJSON* r = cJSON_CreateObject();
             cJSON_AddNumberToObject(r, "entity", e->id);
@@ -1128,6 +1194,7 @@ std::string handle(const std::string& line) {
         // Toggle RAW (ESP cues, CH_DATA_RAW float32) vs BAKED streaming.
         Entity* e = pick_entity(a);
         if (!e || e->type != EntityType::HIL) ERR("no HIL entity");
+        else if (e->hil_backend == HilBackend::MP6) ERR("entity is on the MP6 (Motum Mega) backend; raw-HIL device operations do not apply");
         else if (boolarg(a, "value", true) && !e->hil_cap_raw) ERR("device does not advertise raw-HIL");
         else {
             e->hil_raw_mode = boolarg(a, "value", true);
@@ -1140,6 +1207,7 @@ std::string handle(const std::string& line) {
     else if (!strcmp(cmd, "hil_tx_rate")) {
         Entity* e = pick_entity(a);
         if (!e || e->type != EntityType::HIL) ERR("no HIL entity");
+        else if (e->hil_backend == HilBackend::MP6) ERR("entity is on the MP6 (Motum Mega) backend; use the MP6 target cadence (mp6_command or the Settings tab)");
         else {
             int hz = (int)num(a, "hz", e->hil_tx_hz);
             if (hz < 10) hz = 10; if (hz > 1000) hz = 1000;
@@ -1150,18 +1218,249 @@ std::string handle(const std::string& line) {
             RESULT(r);
         }
     }
-    else if (!strcmp(cmd, "estop")) {
-        // Mirror of the toolbar E-STOP: kill motion, playback, plugin, inputs.
-        g_app.motion_started = false;
-        if (g_app.capture_playing) g_app.stopCapturePlayback();
-        if (g_app.plugin_mgr.activeIndex() >= 0)
-            g_app.plugin_mgr.deactivateActive();
-        for (auto& e : g_app.entities)
-            memset(e.state.input_pct, 0, sizeof(e.state.input_pct));
-        {
-            std::lock_guard<std::mutex> lock(g_app.input_mutex);
-            memset(g_app.shared_input, 0, sizeof(g_app.shared_input));
+    else if (!strcmp(cmd, "mp6_status")) {
+        // Observed MP6 state for one entity. Always allowed in documentation
+        // mode: it reports the app's mirrored observation, never device I/O.
+        std::string res_err;
+        Entity* e = resolve_mp6_entity(a, &res_err);
+        if (!e) ERR(res_err.c_str());
+        else {
+            auto& m = e->mp6;
+            cJSON* r = cJSON_CreateObject();
+            cJSON_AddNumberToObject(r, "entity", e->id);
+            cJSON_AddStringToObject(r, "link_port", m.link_port);
+            cJSON_AddNumberToObject(r, "link_baud", m.link_baud);
+            cJSON_AddBoolToObject(r, "link_open", m.link_open);
+            cJSON_AddNumberToObject(r, "lifecycle", (int)m.lifecycle);   // Mp6Lifecycle value
+            cJSON_AddStringToObject(r, "lifecycle_note", m.lifecycle_note);
+            cJSON_AddNumberToObject(r, "cmd2_hz", m.cmd2_hz);
+            cJSON_AddBoolToObject(r, "onboard_control", m.onboard_control);
+            cJSON_AddBoolToObject(r, "identity_ok", m.identity_ok);
+            cJSON_AddNumberToObject(r, "platform_expected", m.platform_number_expected);
+            cJSON_AddNumberToObject(r, "platform_observed", m.platform_number_ob);
+            cJSON_AddBoolToObject(r, "paired", m.paired_config);
+            cJSON_AddNumberToObject(r, "runmode", m.runmode_ob);
+            cJSON_AddBoolToObject(r, "ok_to_run", m.ok2run_ob);
+            cJSON_AddBoolToObject(r, "config_received", m.config_received_ob);
+            cJSON_AddBoolToObject(r, "av_ok", m.av_ok);
+            cJSON_AddBoolToObject(r, "config_ready", m.config_ready);
+            cJSON_AddStringToObject(r, "config_note", m.config_note);
+            cJSON_AddBoolToObject(r, "config_send_ok", m.config_send_ok);
+            cJSON_AddNumberToObject(r, "config_attempts", m.config_attempts);
+            // Session fix F8: 56 parameter values are transmitted, the end
+            // ack is 57 — reported separately, never conflated.
+            cJSON_AddNumberToObject(r, "config_params_transmitted", m.config_params_transmitted);
+            cJSON_AddNumberToObject(r, "config_params_ack", m.config_params_ack);
+            // Session fix F11: a terminal serial-reader failure stops the
+            // session silently; surfaced so the recovery (reconnect) is named.
+            cJSON_AddBoolToObject(r, "link_read_failed", m.link_read_failed);
+            {
+                cJSON* rp = cJSON_CreateObject();
+                cJSON_AddBoolToObject(rp, "active", m.ramp_active);
+                cJSON_AddNumberToObject(rp, "phase", m.ramp_phase);
+                cJSON_AddBoolToObject(rp, "endpoint_reached", m.ramp_endpoint_reached);
+                cJSON_AddBoolToObject(rp, "settled", m.ramp_settled);
+                cJSON_AddNumberToObject(rp, "duration_ms", m.ramp_duration_ms);
+                cJSON_AddNumberToObject(rp, "timeout_ms", m.ramp_timeout_ms);
+                double ramp_cur[6];
+                for (int i = 0; i < 6; i++) ramp_cur[i] = m.ramp_current[i];
+                cJSON_AddItemToObject(rp, "current_steps", cJSON_CreateDoubleArray(ramp_cur, 6));
+                cJSON_AddItemToObject(r, "ramp", rp);
+            }
+            cJSON* d = cJSON_CreateObject();
+            cJSON_AddBoolToObject(r, "pivot_z_provenance_reviewed",
+                                  e->mp6.design.pivot_z_provenance == 2);
+            cJSON_AddBoolToObject(d, "supplied", m.design.supplied);
+            cJSON_AddNumberToObject(d, "base_radius_mm", m.design.base_radius_mm);
+            cJSON_AddNumberToObject(d, "platform_radius_mm", m.design.platform_radius_mm);
+            cJSON_AddNumberToObject(d, "x_offset_mm", m.design.x_offset_mm);
+            cJSON_AddItemToObject(r, "design", d);
+            cJSON_AddNumberToObject(r, "fault_code", m.fault_code);
+            cJSON_AddBoolToObject(r, "fault_latched", m.fault_latched);
+            cJSON_AddBoolToObject(r, "estop_latched", m.estop_latched);
+            cJSON_AddBoolToObject(r, "feedback_valid", m.feedback_valid);
+            cJSON_AddBoolToObject(r, "target_pose_valid", m.target_pose_valid);
+            cJSON_AddBoolToObject(r, "step_target_valid", m.step_target_valid);
+            cJSON_AddNumberToObject(r, "tel_type48_per_sec", m.tel_hz_est);
+            cJSON_AddNumberToObject(r, "tx_hz", e->rate_tx_hz);
+            cJSON_AddNumberToObject(r, "achieved_target_hz", m.achieved_target_hz);
+            cJSON_AddNumberToObject(r, "missed_cadence_slots", (double)m.missed_cadence_slots);
+            cJSON_AddBoolToObject(r, "cadence_normalised", m.cadence_normalised);
+            cJSON_AddBoolToObject(r, "shutdown_pending", m.shutdown_pending);
+            cJSON_AddNumberToObject(r, "applied_pid_mode", m.applied_pid_mode);
+            if (m.supplies_valid) {
+                double sup[3] = { m.supplies[0], m.supplies[1], m.supplies[2] };
+                cJSON_AddItemToObject(r, "supplies_volts", cJSON_CreateDoubleArray(sup, 3));
+            }
+            if (m.pressure_valid) {
+                cJSON_AddNumberToObject(r, "pressure_psi", m.pneu_psi);
+                cJSON_AddNumberToObject(r, "pressure_aim_psi", m.pneu_aim_psi);
+            }
+            cJSON_AddStringToObject(r, "last_error", m.last_error);
+            cJSON_AddStringToObject(r, "last_action", m.last_action);
+            RESULT(r);
         }
+    }
+    else if (!strcmp(cmd, "mp6_connect")) {
+        cJSON* ej = a ? cJSON_GetObjectItem(a, "entity") : nullptr;
+        if (!ej) ej = a ? cJSON_GetObjectItem(a, "id") : nullptr;
+        Entity* e = nullptr;
+        if (ej) {
+            std::string why;
+            e = resolve_mp6_entity(a, &why);
+            if (!e) { ERR(why.c_str()); return out; }
+        } else {
+            for (auto& ent : g_app.entities) {
+                if (ent.type == EntityType::HIL && ent.hil_backend == HilBackend::MP6) { e = &ent; break; }
+            }
+            if (!e) e = &g_app.addEntity(strarg(a, "name", "MP6 HIL"), EntityType::HIL, HilBackend::MP6);
+        }
+        const char* port = strarg(a, "port", nullptr);
+        if (port && port[0]) snprintf(e->mp6.link_port, sizeof(e->mp6.link_port), "%s", port);
+        double baud = num(a, "baud", 0);
+        if (baud > 0) e->mp6.link_baud = (int)baud;
+        std::string why;
+        if (!g_app.mp6Connect(*e, &why)) ERR(why.c_str());
+        else {
+            cJSON* r = cJSON_CreateObject();
+            cJSON_AddNumberToObject(r, "entity", e->id);
+            cJSON_AddStringToObject(r, "port", e->mp6.link_port);
+            cJSON_AddBoolToObject(r, "open", true);
+            RESULT(r);
+        }
+    }
+    else if (!strcmp(cmd, "mp6_recover_known_state")) {
+        std::string why;
+        Entity* e = resolve_mp6_entity(a, &why);
+        if (!e) ERR(why.c_str());
+        else if (!boolarg(a, "physical_state_confirmed", false)) ERR("confirm a known physical state using independent controls first");
+        else if (!g_app.mp6RecoverKnownState(*e, &why)) ERR(why.c_str());
+        else RESULT(nullptr);
+    }
+    else if (!strcmp(cmd, "mp6_disconnect")) {
+        std::string res_err;
+        Entity* e = resolve_mp6_entity(a, &res_err);
+        if (!e) ERR(res_err.c_str());
+        else {
+            g_app.mp6Disconnect(*e);
+            cJSON* r = cJSON_CreateObject();
+            cJSON_AddNumberToObject(r, "entity", e->id);
+            RESULT(r);
+        }
+    }
+    else if (!strcmp(cmd, "mp6_command")) {
+        std::string res_err;
+        Entity* e = resolve_mp6_entity(a, &res_err);
+        const char* in = strarg(a, "intent", "");
+        if (!e) { ERR(res_err.c_str()); }
+        else if (!strcmp(in, "identify") && g_app.mp6IsMotorPowerRequested(*e)) {
+            ERR("cannot identify while motors are enabled; shut down first");
+        }
+        else {
+            Mp6Intent intent = Mp6Intent::None;
+            if      (!strcmp(in, "identify"))   intent = Mp6Intent::Identify;
+            else if (!strcmp(in, "configure"))  intent = Mp6Intent::Configure;
+            else if (!strcmp(in, "initialize")) intent = Mp6Intent::Initialize;
+            else if (!strcmp(in, "start"))      intent = Mp6Intent::Start;
+            else if (!strcmp(in, "stop"))       intent = Mp6Intent::Stop;
+            else if (!strcmp(in, "park"))       intent = Mp6Intent::Park;
+            else if (!strcmp(in, "shutdown"))   intent = Mp6Intent::Shutdown;
+            else if (!strcmp(in, "disconnect")) intent = Mp6Intent::Disconnect;
+            else ERR("intent must be one of identify|configure|initialize|start|stop|park|shutdown|disconnect");
+            if (intent != Mp6Intent::None) {
+                std::string why;
+                if (!g_app.mp6Command(*e, intent, &why)) ERR(why.c_str());
+                else {
+                    cJSON* r = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(r, "entity", e->id);
+                    cJSON_AddStringToObject(r, "intent", in);
+                    cJSON_AddStringToObject(r, "staged", "true (dispatched on the next update)");
+                    RESULT(r);
+                }
+            }
+        }
+    }
+    else if (!strcmp(cmd, "mp6_config_import")) {
+        std::string res_err;
+        Entity* e = resolve_mp6_entity(a, &res_err);
+        const char* txt = strarg(a, "text", "");
+        if (!e) { ERR(res_err.c_str()); }
+        else if (g_app.mp6IsMotorPowerRequested(*e)) {
+            ERR("cannot change platform configuration while motors are enabled; shut down first");
+        }
+        else {
+            std::string why;
+            if (!g_app.mp6ImportPlatformConfigText(*e, txt, &why)) ERR(why.c_str());
+            else {
+                cJSON* r = cJSON_CreateObject();
+                cJSON_AddNumberToObject(r, "entity", e->id);
+                cJSON_AddBoolToObject(r, "present", e->mp6.platform_config_present);
+                cJSON_AddBoolToObject(r, "config_ready", e->mp6.config_ready);
+                cJSON_AddStringToObject(r, "note", e->mp6.config_note);
+                RESULT(r);
+            }
+        }
+    }
+    else if (!strcmp(cmd, "mp6_controller_settings")) {
+        std::string res_err;
+        Entity* e = resolve_mp6_entity(a, &res_err);
+        if (!e) { ERR(res_err.c_str()); return out; }
+        if (g_app.mp6IsMotorPowerRequested(*e)) {
+            ERR("cannot modify controller settings while motors are enabled; shut down first");
+            return out;
+        }
+        else {
+            Mp6MachineSettings ms = e->mp6.controller_settings;
+            // Initial supply is complete; subsequent edits inherit only a
+            // previously accepted explicit record. Reject wrong types before casts.
+            for (unsigned i = 0; i < 16; ++i) {
+                cJSON* field = a ? cJSON_GetObjectItem(a, mp6MachineSettingNames[i]) : nullptr;
+                if (!field) continue;
+                bool boolean = i == 13 || i == 14;
+                bool fractional = i == 4 || i == 6 || i == 9;
+                if (boolean ? !cJSON_IsBool(field)
+                    : (!cJSON_IsNumber(field) || !std::isfinite(field->valuedouble)
+                        || field->valuedouble < INT_MIN || field->valuedouble > INT_MAX
+                        || (!fractional && std::floor(field->valuedouble) != field->valuedouble))) {
+                    ERR("machine setting has invalid JSON type or numeric domain"); return out;
+                }
+                ms.explicit_fields |= 1u << i;
+            }
+            if (has(a, "sensor_filter_start")) ms.sensor_filter_start = (float)num(a, "sensor_filter_start", ms.sensor_filter_start);
+            if (has(a, "history_len_start")) ms.history_len_start = (int)num(a, "history_len_start", ms.history_len_start);
+            if (has(a, "bench_test")) ms.bench_test = (int)num(a, "bench_test", ms.bench_test);
+            if (has(a, "comms_timeout_ms")) ms.comms_timeout_ms = (int)num(a, "comms_timeout_ms", ms.comms_timeout_ms);
+            if (has(a, "onboard_shutdown")) ms.onboard_shutdown = (int)num(a, "onboard_shutdown", ms.onboard_shutdown);
+            if (has(a, "mot_val_final")) ms.mot_val_final = (int)num(a, "mot_val_final", ms.mot_val_final);
+            if (has(a, "sensor_filter")) ms.sensor_filter = (float)num(a, "sensor_filter", ms.sensor_filter);
+            if (has(a, "history_len")) ms.history_len = (int)num(a, "history_len", ms.history_len);
+            if (has(a, "deadband_enable")) ms.deadband_enable = (int)num(a, "deadband_enable", ms.deadband_enable);
+            if (has(a, "av_filter")) ms.av_filter = (float)num(a, "av_filter", ms.av_filter);
+            if (has(a, "limits_enable")) ms.limits_enable = (int)num(a, "limits_enable", ms.limits_enable);
+            if (has(a, "info_motor")) ms.info_motor = (int)num(a, "info_motor", ms.info_motor);
+            if (has(a, "pid_index")) ms.pid_index = (int)num(a, "pid_index", ms.pid_index);
+            if (has(a, "pressure_enabled")) ms.pressure_enabled = boolarg(a, "pressure_enabled", ms.pressure_enabled);
+            if (has(a, "pressure_aim_supplied")) ms.pressure_aim_supplied = boolarg(a, "pressure_aim_supplied", ms.pressure_aim_supplied);
+            if (has(a, "pressure_aim_psi")) ms.pressure_aim_psi = (int)num(a, "pressure_aim_psi", ms.pressure_aim_psi);
+
+            std::string why;
+            if (!g_app.mp6SetControllerSettings(*e, ms, &why)) {
+                ERR(why.c_str());
+            } else {
+                cJSON* r = cJSON_CreateObject();
+                cJSON_AddNumberToObject(r, "entity", e->id);
+                cJSON_AddBoolToObject(r, "supplied", e->mp6.controller_settings.supplied);
+                cJSON_AddNumberToObject(r, "pid_index", e->mp6.controller_settings.pid_index);
+                cJSON_AddNumberToObject(r, "comms_timeout_ms", e->mp6.controller_settings.comms_timeout_ms);
+                cJSON_AddNumberToObject(r, "pressure_aim_psi", e->mp6.controller_settings.pressure_aim_psi);
+                RESULT(r);
+            }
+        }
+    }
+    else if (!strcmp(cmd, "estop")) {
+        // Mirror of the toolbar E-STOP: kills motion, playback, plugin, inputs
+        // and stages stop/shutdown for MP6 entities (single funnel).
+        g_app.requestEstop();
         g_app.log(-1, "system", "E-STOP via control API");
         RESULT(nullptr);
     }
@@ -1332,6 +1631,8 @@ std::string handle(const std::string& line) {
 
 } // namespace
 
+std::string DispatchControlCommand(const std::string& line) { return handle(line); }
+
 // ── drain: execute queued commands on the render thread ─────────────
 void ControlServer::drain() {
     for (;;) {
@@ -1343,7 +1644,7 @@ void ControlServer::drain() {
             g_queue.pop_front();
         }
         std::string resp;
-        try { resp = handle(r.line); }
+        try { resp = DispatchControlCommand(r.line); }
         catch (...) { resp = err_resp(0, "handler exception"); }
         r.resp.set_value(resp);
     }

@@ -4,6 +4,7 @@
 #include "udp_transport.h"
 #include "platform_viz.h"
 #include "test_harness_panel.h"
+#include "mp6_geometry.h"
 #include "cJSON.h"
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -16,6 +17,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <unordered_map>
 #include <filesystem>
 #include <mutex>
 #include <map>
@@ -661,6 +663,11 @@ static void DrawMainMenuBar() {
                 snprintf(name, sizeof(name), "HIL #%d", g_app.next_entity_id);
                 g_app.addEntity(name, EntityType::HIL);
             }
+            if (ImGui::MenuItem("Add HIL (MP6 Motum Mega)")) {
+                char name[64];
+                snprintf(name, sizeof(name), "MP6 HIL #%d", g_app.next_entity_id);
+                g_app.addEntity(name, EntityType::HIL, HilBackend::MP6);
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
@@ -926,7 +933,7 @@ static void DrawToolbar() {
             }
             if (ImGui::Button("START", ImVec2(52, 26))) {
                 if (!running) {
-                    g_app.motion_started = true;
+                    g_app.startMotion();
                     // Activate plugin if Plugin source is selected
                     if (g_app.input_source == InputSource::Plugin && g_app.active_plugin_idx >= 0 &&
                         g_app.plugin_mgr.activeIndex() < 0) {
@@ -943,8 +950,8 @@ static void DrawToolbar() {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.35f, 0.35f, 0.35f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.45f, 0.45f, 0.45f, 1.0f));
             if (ImGui::Button("STOP", ImVec2(46, 26))) {
-                if (running) {
-                    g_app.motion_started = false;
+                {
+                    g_app.stopMotion();
                     if (g_app.plugin_mgr.activeIndex() >= 0)
                         g_app.plugin_mgr.deactivateActive();
                     // Zero all entities
@@ -965,16 +972,7 @@ static void DrawToolbar() {
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.15f, 0.15f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.0f, 0.0f, 1.0f));
             if (ImGui::Button("E-STOP", ImVec2(56, 26))) {
-                g_app.motion_started = false;
-                if (g_app.capture_playing) g_app.stopCapturePlayback();
-                if (g_app.plugin_mgr.activeIndex() >= 0)
-                    g_app.plugin_mgr.deactivateActive();
-                for (auto& e : g_app.entities)
-                    memset(e.state.input_pct, 0, sizeof(e.state.input_pct));
-                {
-                    std::lock_guard<std::mutex> lock(g_app.input_mutex);
-                    memset(g_app.shared_input, 0, sizeof(g_app.shared_input));
-                }
+                g_app.requestEstop();   // one funnel: motion, playback, inputs and MP6 stop/shutdown staging
             }
             ImGui::PopStyleColor(3);
         }
@@ -1800,6 +1798,8 @@ static void DrawPlatformSetupContent(Entity& e);
 static void DrawEntitySettingsContent(Entity& e);
 static void DrawEntityConsoleContent(Entity& e);
 static void DrawEntityDynamicsContent(Entity& e);
+static void DrawMp6SettingsContent(Entity& e);
+static void DrawMp6PlatformSetupContent(Entity& e);
 
 // ── Entity Card (3D viewport placeholder + readout) ─────────────────
 
@@ -1809,7 +1809,8 @@ static void DrawEntityCard(Entity& e) {
     ImVec4 col = ColorFromFloat4(e.color);
 
     char title[128];
-    const char* type_str = (e.type == EntityType::SIL) ? "SIL" : "HIL";
+    const char* type_str = (e.type == EntityType::SIL) ? "SIL"
+                         : (e.hil_backend == HilBackend::MP6 ? "HIL·MP6" : "HIL");
     snprintf(title, sizeof(title), "%s [%s]###entity_%d", e.name, type_str, e.id);
 
     ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(col.x * 0.3f, col.y * 0.3f, col.z * 0.3f, 1.0f));
@@ -1865,10 +1866,63 @@ static void DrawEntityCard(Entity& e) {
 
                 // HIL status overlay on 3D viewport
                 if (e.type == EntityType::HIL) {
-                    bool hil_connected = e.serial && e.serial->isOpen();
+                    bool mp6_entity = (e.hil_backend == HilBackend::MP6);
+                    bool hil_connected = !mp6_entity && e.serial && e.serial->isOpen();
                     const char* label = nullptr;
                     ImU32 label_col = 0;
-                    if (e.hil_tel_active) {
+                    if (mp6_entity) {
+                        // MP6 labels come from observed MP6 state only; the
+                        // ESP32 telemetry chain never applies to this backend.
+                        if (e.mp6.fault_latched) {
+                            label = "MP6 FAULT (TX suppressed)";
+                            label_col = IM_COL32(240, 60, 50, 255);
+                        } else {
+                            switch (e.mp6.lifecycle) {
+                                case Mp6Lifecycle::Running:
+                                    label = "MP6 RUNNING (onboard control)";
+                                    label_col = IM_COL32(60, 200, 120, 255);
+                                    break;
+                                case Mp6Lifecycle::Initializing:
+                                case Mp6Lifecycle::Configuring:
+                                case Mp6Lifecycle::Identifying:
+                                    label = "MP6 LIFECYCLE STEP ACTIVE";
+                                    label_col = IM_COL32(240, 180, 50, 255);
+                                    break;
+                                case Mp6Lifecycle::IdentityLost:
+                                case Mp6Lifecycle::Faulted:
+                                    label = "MP6 IDENTITY/FAULT STATE";
+                                    label_col = IM_COL32(240, 140, 40, 255);
+                                    break;
+                                case Mp6Lifecycle::Identified:
+                                case Mp6Lifecycle::Configured:
+                                case Mp6Lifecycle::Parked:
+                                case Mp6Lifecycle::Parking:
+                                    label = e.mp6.lifecycle == Mp6Lifecycle::Parked
+                                        ? "MP6 PARKED (ZONE NEUTRAL READY; start allowed)"
+                                        : "MP6 LIFECYCLE SETTLED";
+                                    label_col = e.mp6.lifecycle == Mp6Lifecycle::Parked
+                                        ? IM_COL32(60, 200, 120, 255)
+                                        : IM_COL32(120, 190, 140, 255);
+                                    break;
+                                case Mp6Lifecycle::Docked:
+                                    label = "MP6 DOCKED (observed calibrated base)";
+                                    label_col = IM_COL32(80, 170, 220, 255);
+                                    break;
+                                case Mp6Lifecycle::Connecting:
+                                    label = "MP6 LINK OPEN (awaiting controller)";
+                                    label_col = IM_COL32(240, 180, 50, 255);
+                                    break;
+                                case Mp6Lifecycle::SafeOff:
+                                    label = "MP6 SAFE-OFF (motors disabled; reconnect to resume)";
+                                    label_col = IM_COL32(240, 140, 40, 255);
+                                    break;
+                                default:
+                                    label = "MP6 OFFLINE";
+                                    label_col = IM_COL32(120, 120, 130, 200);
+                                    break;
+                            }
+                        }
+                    } else if (e.hil_tel_active) {
                         label = "ESP32 TELEMETRY";
                         label_col = IM_COL32(60, 200, 120, 255);
                     } else if (hil_connected) {
@@ -2095,6 +2149,18 @@ static void DrawEntityCard(Entity& e) {
                 ImGui::Separator();
                 if (e.type == EntityType::SIL) {
                     ImGui::Text("IK: %.0f Hz", e.rate_ik_hz);
+                } else if (e.hil_backend == HilBackend::MP6) {
+                    if (e.mp6.link_open) {
+                        ImGui::Text("TX: %.0f Hz | Tel: %d type-48/s (MP6)",
+                                    e.rate_tx_hz, e.mp6.tel_hz_est);
+                        if (e.mp6.fault_latched) {
+                            ImGui::SameLine();
+                            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f),
+                                               "| FAULT %u", (unsigned)e.mp6.fault_code);
+                        }
+                    } else {
+                        ImGui::TextDisabled("MP6 offline");
+                    }
                 } else {
                     bool hil_conn = e.serial && e.serial->isOpen();
                     if (hil_conn) {
@@ -2175,14 +2241,18 @@ static void DrawEntityCard(Entity& e) {
             //  Platform tab
             // ════════════════════════════════════════════════════════════
             if (UIBeginTab("Platform", s_ui_entity_tabs[e.id], s_ui_pending_entity_tabs[e.id])) {
-                DrawPlatformSetupContent(e);
+                if (e.hil_backend == HilBackend::MP6)
+                    DrawMp6PlatformSetupContent(e);
+                else
+                    DrawPlatformSetupContent(e);
                 ImGui::EndTabItem();
             }
 
             // ════════════════════════════════════════════════════════════
-            //  Test Harness tab (HIL only)
+            //  Test Harness tab (ESP32 HIL only: raw-HIL cue/config device
+            //  operations are meaningless on the MP6 OnboardSerial protocol)
             // ════════════════════════════════════════════════════════════
-            if (e.type == EntityType::HIL) {
+            if (e.type == EntityType::HIL && e.hil_backend == HilBackend::ESP32) {
                 if (UIBeginTab("Test Harness", s_ui_entity_tabs[e.id], s_ui_pending_entity_tabs[e.id])) {
                     DrawTestHarnessTabContent(e);
                     ImGui::EndTabItem();
@@ -2211,6 +2281,231 @@ static void DrawEntityCard(Entity& e) {
     }
     ImGui::End();
     ImGui::PopStyleColor(2);
+    ImGui::PopID();
+}
+
+// ── MP6 Platform Setup (Platform tab for MP6 entities) ───────────────
+//
+// The real gearbox/step machine numbers live inside the unmodified MOTUM Mega
+// and are installed there through the command-5 transaction; the app never
+// fabricates those numbers. App-side ownership per the mp6_geometry contract:
+// the design-table numbers (or measured Manual values), the per-axis pivot z
+// (unrecovered points-file data — explicit entry only), the MotConv point
+// zeros (unresolved mapping — explicit entry only) and the post-cue pose
+// convention. Readiness diagnostics name anything still missing; nothing is
+// picked up from embedded fixtures or zero defaults.
+static void DrawMp6PlatformSetupContent(Entity& e) {
+    ImGui::PushID(e.id + 7500);
+    {
+        ImGui::Text("MP6 Platform Setup");
+        ImGui::Separator();
+        ImGui::TextWrapped("The controller owns gearbox/step geometry and its own "
+                           "calibration; the app installs it with the command-5 config "
+                           "transaction and observes it, never replaces it.");
+        ImGui::Spacing();
+
+        // ── Design table ─────────────────────────────────────────────────
+        static std::unordered_map<int, Mp6DesignState> design_drafts;
+        auto it_draft = design_drafts.try_emplace(e.id, e.mp6.design).first;
+        Mp6DesignState& draft = it_draft->second;
+        bool motors_powered = g_app.mp6IsMotorPowerRequested(e) || e.mp6.sending_config || e.mp6.shutdown_pending;
+        ImGui::TextDisabled("Editing draft; Apply accepts these values and retires prior readiness.");
+        if (motors_powered) ImGui::BeginDisabled();
+        ImGui::Text("Design (frm_Design table or Manual measurement)");
+        static const char* kDesignNames[] = { "MOT155-D", "MOT155-D1", "MOT155-D2",
+                                              "2010+", "2010", "2009", "Manual" };
+        std::string preview = draft.design_name[0] ? draft.design_name
+                                                          : "(select design)";
+        if (ImGui::BeginCombo("##mp6design", preview.c_str())) {
+            for (const char* dn : kDesignNames) {
+                bool is_sel = preview == dn;
+                if (ImGui::Selectable(dn, is_sel)) {
+                    snprintf(draft.design_name, sizeof(draft.design_name), "%s", dn);
+                    mp6::Mp6DesignParams tbl;
+                    if (strcmp(dn, "Manual") != 0 && mp6::mp6_design(mp6::mp6_design_from_name(dn), &tbl)) {
+                        // Table values only; the tbl numbers are exactly the
+                        // recovered frm_Design table, never a fixture.
+                        draft.bot_a_mm = (float)tbl.bot_a_mm;
+                        draft.bot_b_mm = (float)tbl.bot_b_mm;
+                        draft.top_a_mm = (float)tbl.top_a_mm;
+                        draft.top_b_mm = (float)tbl.top_b_mm;
+                        draft.crank_length_mm = (float)tbl.crank_length_mm;
+                        draft.off_x_mm = (float)tbl.off_x_mm;
+                        draft.pcdx_mm = (float)tbl.pcdx_mm;
+                        draft.pcdy_mm = (float)tbl.pcdy_mm;
+                        draft.rod_length_mm = (float)tbl.rod_length_mm;
+                        draft.z_off_mm = (float)tbl.z_off_mm;
+                        // pltc overrides (rod/crank/x-offset/angle-offset/Z-Offset)
+                        // are applied at solver rebuild time, so the .pltc stays
+                        // the higher-priority actual config.
+                    } else if (strcmp(dn, "Manual") == 0) {
+                        ImGui::TextDisabled("Manual: enter measured values below.");
+                    }
+                    draft.base_radius_mm     = draft.bot_b_mm;
+                    draft.platform_radius_mm = draft.top_b_mm;
+                    draft.x_offset_mm        = draft.off_x_mm;
+                }
+                if (is_sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("pltc rows override rod/crank/x-offset/angle-off at rebuild");
+
+        ImGui::PushID("mp6platdesign");
+        if (motors_powered) {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                "Motors are currently enabled (%s). Shut down first to edit geometry.",
+                mp6LifecycleToString(e.mp6.lifecycle));
+            ImGui::BeginDisabled();
+        }
+        bool dgeo_changed = false;
+        ImGui::Text("Design table params");
+        dgeo_changed |= ImGui::DragFloat("BotA", &draft.bot_a_mm, 0.25f, 1.0f, 3000.0f, "%.1f mm");
+        dgeo_changed |= ImGui::DragFloat("BotB", &draft.bot_b_mm, 0.25f, 1.0f, 3000.0f, "%.1f mm");
+        dgeo_changed |= ImGui::DragFloat("TopA", &draft.top_a_mm, 0.25f, 1.0f, 3000.0f, "%.1f mm");
+        dgeo_changed |= ImGui::DragFloat("TopB", &draft.top_b_mm, 0.25f, 1.0f, 3000.0f, "%.1f mm");
+        dgeo_changed |= ImGui::DragFloat("Crank length", &draft.crank_length_mm, 0.25f, 1.0f, 3000.0f, "%.1f mm");
+        dgeo_changed |= ImGui::DragFloat("Rod length", &draft.rod_length_mm, 0.25f, 1.0f, 3000.0f, "%.1f mm");
+        dgeo_changed |= ImGui::DragFloat("OffX (motor loc.)", &draft.off_x_mm, 0.25f, -1000.0f, 1000.0f, "%.1f mm");
+        dgeo_changed |= ImGui::DragFloat("PCDX", &draft.pcdx_mm, 0.25f, -1000.0f, 1000.0f, "%.1f mm");
+        dgeo_changed |= ImGui::DragFloat("PCDY", &draft.pcdy_mm, 0.25f, -1000.0f, 1000.0f, "%.1f mm");
+        dgeo_changed |= ImGui::DragFloat("ZOff (design)", &draft.z_off_mm, 0.25f, -2000.0f, 4000.0f, "%.1f mm");
+        dgeo_changed |= ImGui::DragFloat("Angle Offset", &draft.angle_offset_deg, 0.1f, -360.0f, 360.0f, "%.2f deg");
+
+        ImGui::Spacing();
+        ImGui::Text("Unresolved real data — explicit entry only");
+        ImGui::TextColored(ImVec4(0.98f, 0.75f, 0.15f, 1.0f),
+            "The pivot z points file (Other\\<Platform>.txt) is unrecovered and the\n"
+            "MotConv point-zero mapping is unresolved. Nothing here is defaulted;\n"
+            "embedded fixture values are never used as machine configuration.");
+        ImGui::PushID("mp6pivotz");
+        bool z_changed = false;
+        char zl[32];
+        for (int i = 0; i < 6; i++) {
+            snprintf(zl, sizeof(zl), "Base Z %d", i + 1);
+            z_changed |= ImGui::InputFloat(zl, &draft.base_z_mm[i], 0.5f, 5.0f, "%.2f mm");
+            ImGui::SameLine();
+            snprintf(zl, sizeof(zl), "Top Z %d##t", i + 1);
+            z_changed |= ImGui::InputFloat(zl, &draft.top_z_mm[i], 0.5f, 5.0f, "%.2f mm");
+        }
+        ImGui::PopID();
+        // F4 provenance gate: an edit makes the values *supplied* but never
+        // *reviewed*. kReviewed is granted only by the explicit review action
+        // below; kFixtureOnly never exists in this live UI at all.
+        if (z_changed && draft.pivot_z_provenance == 2) {
+            // Values changed after review — the review no longer describes
+            // what is staged; drop back to Unreviewed honestly.
+            draft.pivot_z_provenance = 0;
+            g_app.log(e.id, "mp6",
+                      "Pivot z edited after review — provenance reset to Unreviewed");
+        }
+        {
+            const char* ps; ImVec4 pc;
+            if (draft.pivot_z_provenance == 2) {
+                ps = "REVIEWED (explicit review action)"; pc = ImVec4(0.3f, 0.9f, 0.5f, 1.0f);
+            } else if (draft.stale_older_config) {
+                ps = "UNREVIEWED — older settings load; re-import and re-review";
+                pc = ImVec4(0.98f, 0.55f, 0.2f, 1.0f);
+            } else {
+                ps = "UNREVIEWED (blocks the crank solver)"; pc = ImVec4(0.98f, 0.75f, 0.15f, 1.0f);
+            }
+            ImGui::TextColored(pc, "Pivot z provenance: %s", ps);
+            int prov = draft.pivot_z_provenance;
+            if (ImGui::Button("Mark pivot z as reviewed##rev")) {
+                // Explicit two-step review — Review first, then acknowledge to
+                // prevent a single accidental click granting kReviewed.
+                mp6ReviewDesign(draft, Mp6ReviewAction::MarkPivots);
+            }
+            ImGui::SameLine();
+            bool can_confirm = mp6CanConfirmPivots(draft);
+            if (!can_confirm) {
+                ImGui::BeginDisabled();
+            }
+            bool ack = ImGui::Button("Confirm review##revack");
+            if (!can_confirm) ImGui::EndDisabled();
+            if (ack && can_confirm) {
+                mp6ReviewDesign(draft, Mp6ReviewAction::ConfirmPivots);
+                std::string rwhy;
+                (void)rwhy;   // stage rebuild
+                g_app.log(e.id, "mp6",
+                          "Pivot z provenance set to Reviewed by explicit UI review action");
+            }
+            if ( ImGui::SmallButton("Reset to Unreviewed##revr") ) {
+                if (draft.pivot_z_provenance != 0) {
+                    mp6ReviewDesign(draft, Mp6ReviewAction::ResetPivots);
+                    std::string rwhy;
+                    (void)rwhy;   // stage rebuild
+                    g_app.log(e.id, "mp6", "Pivot z provenance reset to Unreviewed");
+                }
+            }
+            ImGui::TextDisabled("Reviewed means the digits above were checked against the\n"
+                                "machine points data (imported Other\\<Platform>.txt). The\n"
+                                "review is stare-and-compare only — no crash-verification.");
+        }
+        ImGui::Spacing();
+        ImGui::Text("MotConv point zeros (lblX / lblZ)");
+        bool pz_changed = false;
+        pz_changed |= ImGui::InputFloat("X Point Zero", &draft.point_zero_x_mm, 0.5f, 5.0f, "%.2f mm");
+        pz_changed |= ImGui::InputFloat("Z Point Zero", &draft.point_zero_z_mm, 0.5f, 5.0f, "%.2f mm");
+        if (pz_changed) {
+            draft.point_zero_supplied = false;
+            g_app.settings_dirty = true;
+        }
+        ImGui::PopID();
+
+        ImGui::Spacing();
+        if (ImGui::Button("Confirm Point Zeros")) {
+            mp6ReviewDesign(draft, Mp6ReviewAction::ConfirmPointZeros);
+            g_app.settings_dirty = true;
+            g_app.log(e.id, "mp6", "Point zeros confirmed (X: %.2f, Z: %.2f mm)",
+                      draft.point_zero_x_mm, draft.point_zero_z_mm);
+        }
+        ImGui::SameLine();
+        if (draft.point_zero_supplied) {
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Confirmed");
+        } else {
+            ImGui::TextColored(ImVec4(0.98f, 0.75f, 0.15f, 1.0f), "Unconfirmed — click Confirm Point Zeros");
+        }
+
+        ImGui::Spacing();
+        bool active_motion = (e.mp6.lifecycle == Mp6Lifecycle::Configuring ||
+                              e.mp6.lifecycle == Mp6Lifecycle::Initializing ||
+                              e.mp6.lifecycle == Mp6Lifecycle::Running ||
+                              e.mp6.lifecycle == Mp6Lifecycle::Parking);
+        if (active_motion) ImGui::BeginDisabled();
+        if (ImGui::Button("Apply design geometry")) {
+            std::string why;
+            if (!g_app.mp6AcceptDesign(e, draft, &why)) {
+                snprintf(e.mp6.last_error, sizeof(e.mp6.last_error), "%s", why.c_str());
+                ImGui::TextColored(ImVec4(0.98f, 0.4f, 0.4f, 1.0f), "%s", why.c_str());
+            }
+        }
+        if (active_motion) ImGui::EndDisabled();
+        if (motors_powered) ImGui::EndDisabled();
+        if (motors_powered) ImGui::EndDisabled();
+        ImGui::Separator();
+
+        // ── Target chain status ──────────────────────────────────────────
+        ImGui::Text("Target chain status");
+        ImGui::BulletText("Post-cue pose (mm/rad): %s",
+                          e.mp6.target_pose_valid ? "computed every frame" : "not computed");
+        ImGui::BulletText("Crank solver: %s",
+                          e.mp6.viz.solver_ready ? "ready" : "not initialized");
+        if (e.mp6.solver_note[0]) ImGui::TextDisabled("%s", e.mp6.solver_note);
+        ImGui::BulletText("Step targets (command 2): %s",
+                          e.mp6.step_target_valid ? "computed" : "unavailable");
+        if (e.mp6.step_target_valid) {
+            ImGui::Text("StepAim: %d %d %d %d %d %d",
+                e.mp6.step_target[0], e.mp6.step_target[1], e.mp6.step_target[2],
+                e.mp6.step_target[3], e.mp6.step_target[4], e.mp6.step_target[5]);
+        } else {
+            ImGui::TextDisabled("needs: design + pivot z (provenance Reviewed) + point "
+                                "zeros + parsed .pltc (calibration + travel limits) — "
+                                "the solver note above names the gap.");
+        }
+        (void)dgeo_changed;
+    }
     ImGui::PopID();
 }
 
@@ -2974,6 +3269,438 @@ static void DrawPlatformSetupContent(Entity& e) {
 
 // ── Entity Settings Content (drawn inside entity card tab) ──────────
 
+// Style helpers shared by the MP6 device card.
+static void Mp6MetaChip(const char* label, bool good) {
+    ImVec4 c = good ? ImVec4(0.2f, 0.83f, 0.6f, 1.0f) : ImVec4(0.95f, 0.75f, 0.2f, 1.0f);
+    ImGui::TextColored(c, "%s %s", good ? "[OK]" : "[..]", label);
+}
+
+static void DrawMp6SettingsContent(Entity& e) {
+    ImGui::PushID(e.id + 7000);
+    {
+        // ── Backend selector ─────────────────────────────────────────
+        ImGui::Text("Motion Backend");        {
+            const char* backends[] = { "ESP32 (HIL serial)", "MP6 (Motum Mega, onboard control)" };
+            int be_idx = (e.hil_backend == HilBackend::MP6) ? 1 : 0;
+            // Locked while either backend holds an open connection.
+            bool locked = e.mp6.link_open || (e.serial && e.serial->isOpen());
+            if (!locked) {
+                if (ImGui::Combo("Backend##mp6", &be_idx, backends, 2)) {
+                    e.hil_backend = (be_idx == 1) ? HilBackend::MP6 : HilBackend::ESP32;
+                    g_app.log(e.id, "mp6", "Backend switched to %s",
+                              be_idx == 1 ? "MP6 (Motum Mega)" : "ESP32");
+                    g_app.settings_dirty = true;
+                }
+            } else {
+                ImGui::TextDisabled("%s (locked while connected)", backends[be_idx]);
+            }
+        }
+        if (IsDocumentationMode())
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.15f, 1.0f),
+                "Documentation mode: no real COM opens for any backend.");
+
+        ImGui::Separator();
+
+        // ── Lifecycle status card ────────────────────────────────────
+        ImGui::Text("MP6 Device (%s)", e.mp6.link_port[0] ? e.mp6.link_port : "no COM port");
+        {
+            const char* life;
+            ImVec4 c;
+            switch (e.mp6.lifecycle) {
+                case Mp6Lifecycle::Running: life = "RUNNING";     c = ImVec4(0.2f, 0.83f, 0.6f, 1.0f); break;
+                case Mp6Lifecycle::Initializing:
+                case Mp6Lifecycle::Configuring:
+                case Mp6Lifecycle::Identifying:
+                case Mp6Lifecycle::Connecting: life = "IN PROGRESS"; c = ImVec4(0.98f, 0.75f, 0.15f, 1.0f); break;
+                case Mp6Lifecycle::Faulted: life = "FAULTED";     c = ImVec4(0.98f, 0.4f, 0.4f, 1.0f); break;
+                case Mp6Lifecycle::IdentityLost: life = "IDENTITY LOST"; c = ImVec4(0.98f, 0.6f, 0.3f, 1.0f); break;
+                case Mp6Lifecycle::SafeOff: life = "SAFE-OFF"; c = ImVec4(0.98f, 0.55f, 0.2f, 1.0f); break;
+                // F1 semantics (source-backed, mirrored verbatim): Parked is
+                // the neutral/READY hold start is allowed from; Docked is the
+                // observed calibrated-base settle (the only vent stage) —
+                // neither is relabelled as the other.
+                case Mp6Lifecycle::Parked: life = "PARKED (NEUTRAL READY)"; c = ImVec4(0.2f, 0.83f, 0.6f, 1.0f); break;
+                case Mp6Lifecycle::Docked: life = "DOCKED (calibrated base)"; c = ImVec4(0.3f, 0.7f, 0.9f, 1.0f); break;
+                case Mp6Lifecycle::Parking: life = "PARKING (ramp to dock)"; c = ImVec4(0.98f, 0.75f, 0.15f, 1.0f); break;
+                case Mp6Lifecycle::Disconnected: case Mp6Lifecycle::Unknown:
+                default: life = "OFFLINE"; c = ImVec4(0.6f, 0.6f, 0.65f, 1.0f); break;
+            }
+            ImGui::TextColored(c, "State: %s", life);
+            ImGui::TextWrapped("%s", e.mp6.lifecycle_note);
+        }
+
+        // Onboard fault banner: never styleable away, never clearable from here.
+        if (e.mp6.fault_latched) {
+            ImVec4 bg(0.55f, 0.12f, 0.08f, 0.95f);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
+            ImGui::BeginChild("##mp6_fault", ImVec2(-1, 0), true, ImGuiWindowFlags_AlwaysAutoResize);
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.25f, 1.0f), "ONBOARD FAULT LATCHED (%u)", (unsigned)e.mp6.fault_code);
+            ImGui::TextWrapped("%s", e.mp6.fault_text);
+            ImGui::TextWrapped("TX is suppressed by the controller itself. Recovery is a "
+                               "re-pair on a fresh connect, not a manual clear; this app "
+                               "does not pretend otherwise.");
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+        }
+
+        // ── Connection controls ──────────────────────────────────────
+        bool doc_mode = IsDocumentationMode();
+        if (e.mp6.link_open) {
+            ImGui::TextColored(ImVec4(0.2f, 0.83f, 0.6f, 1.0f), "Link open: %s @ %d (raw 8N1, RTS/DTR low)",
+                               e.mp6.link_port, e.mp6.link_baud);
+            ImGui::Text("Cadence: %d Hz target frames | Onboard control: %s",
+                        e.mp6.cmd2_hz, e.mp6.onboard_control ? "yes (only mode)" : "no");
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.20f, 0.20f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.95f, 0.30f, 0.30f, 1.0f));
+            if (ImGui::Button("Disconnect##mp6", ImVec2(-1, 28)))
+                g_app.mp6Command(e, Mp6Intent::Disconnect, nullptr);
+            ImGui::PopStyleColor(2);
+            ImGui::TextDisabled("Disconnect closes the app side only; the controller "
+                                "is left as-is and its state is unverified.");
+            ImGui::Checkbox("Auto-connect##mp6", &e.mp6.auto_connect);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Stored user choice; reconnects every 2 s.\nDefaults OFF for safety.");
+        } else {
+            ImGui::TextDisabled("Not connected (default: real connection OFF)");
+            ImGui::SetNextItemWidth(160);
+            ImGui::InputText("COM port##mp6", e.mp6.link_port, sizeof(e.mp6.link_port));
+            if (ImGui::IsItemEdited()) g_app.settings_dirty = true;
+            // COM scan (cached; the refresh click enumerates, no port is opened)
+            static std::vector<std::string> s_mp6_ports;
+            if (ImGui::SmallButton("Pick from scan##mp6")) {
+                s_mp6_ports.clear();
+                auto infos = SerialPort::enumerate();
+                for (auto& info : infos) s_mp6_ports.push_back(info.port);
+            }
+            ImGui::SameLine();
+                    if (!s_mp6_ports.empty()) {
+                ImGui::SetNextItemWidth(120);
+                std::string preview = e.mp6.link_port[0] ? e.mp6.link_port : "(select)";
+                std::string combo_id = std::string("##mp6portsel") + std::to_string(e.id);
+                if (ImGui::BeginCombo(combo_id.c_str(), preview.c_str())) {
+                    int sel = -1;
+                    for (int i = 0; i < (int)s_mp6_ports.size(); i++)
+                        if (preview == s_mp6_ports[i]) sel = i;
+                    if (sel < 0) sel = 0;
+                    for (int i = 0; i < (int)s_mp6_ports.size(); i++) {
+                        bool is_sel = (i == sel);
+                        if (ImGui::Selectable(s_mp6_ports[i].c_str(), is_sel))
+                            snprintf(e.mp6.link_port, sizeof(e.mp6.link_port), "%s", s_mp6_ports[i].c_str());
+                        if (is_sel && !ImGui::IsAnyItemHovered()) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            } else {
+                ImGui::TextDisabled("(scan to pick a port)");
+            }
+            ImGui::TextDisabled("Baud: 115200 8N1 (fixed by protocol)");
+            e.mp6.cmd2_hz = 60;
+            ImGui::Text("Target cadence: 60 Hz (fixed by protocol)");
+            if (e.mp6.achieved_target_hz > 0.0) {
+                ImGui::Text("Achieved cadence: %.1f Hz", e.mp6.achieved_target_hz);
+            }
+            if (e.mp6.missed_cadence_slots > 0) {
+                ImGui::TextColored(ImVec4(0.98f, 0.55f, 0.2f, 1.0f), "Missed cadence slots: %llu", (unsigned long long)e.mp6.missed_cadence_slots);
+            }
+            ImGui::Checkbox("Auto-connect##mp6", &e.mp6.auto_connect);
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.55f, 0.35f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.7f, 0.45f, 1.0f));
+            if (ImGui::Button("Connect##mp6", ImVec2(-1, 28))) {
+                std::string why;
+                g_app.mp6Connect(e, &why);
+            }
+            ImGui::PopStyleColor(2);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Opens the raw MP6 serial link. Never COBS, never\nthe ESP32 transport.");
+        }
+
+        // ── Lifecycle action row ─────────────────────────────────────
+        ImGui::Separator();
+        ImGui::Text("Lifecycle (observation-driven; a click stages, telemetry confirms)");
+        {
+            struct LifeBtn { const char* label; Mp6Intent intent; };
+            LifeBtn btns[] = {
+                { "Identify", Mp6Intent::Identify },
+                { "Configure", Mp6Intent::Configure },
+                { "Initialize", Mp6Intent::Initialize },
+                { "Start", Mp6Intent::Start },
+                { "Stop", Mp6Intent::Stop },
+                { "Park", Mp6Intent::Park },
+                { "Shutdown", Mp6Intent::Shutdown },
+            };
+            for (auto& b : btns) {
+                std::string why;
+                bool dis_btn = (b.intent == Mp6Intent::Identify && g_app.mp6IsMotorPowerRequested(e));
+                if (dis_btn) ImGui::BeginDisabled();
+                if (ImGui::SmallButton(b.label)) g_app.mp6Command(e, b.intent, &why);
+                if (dis_btn) ImGui::EndDisabled();
+                if (ImGui::IsItemHovered() && !e.mp6.link_open)
+                    ImGui::SetTooltip("Link is closed; connect first.");
+                ImGui::SameLine();
+            }
+            ImGui::Dummy(ImVec2(0, 0));
+            ImGui::TextDisabled("Park descends to the calibration dock (observed DOCKED; vent\n"
+                                "stage follows only from there). Shutdown descends from\n"
+                                "Running/Parked/Stopped and vents only after the dock settle.\n"
+                                "The neutral-ready PARKED hold is where Start is allowed.");
+        }
+
+        // ── Explicit recovery (SafeOff / fault / identity loss) ────────
+        // SafeOff leaves the session without a re-attach path and fault /
+        // identity-loss states refuse further intents until re-identified, so
+        // the recovery is a full link reconnect: detach, close, re-attach.
+        // Nothing else in this app resumes motion from those states directly.
+        if (e.mp6.lifecycle == Mp6Lifecycle::SafeOff
+            || e.mp6.lifecycle == Mp6Lifecycle::Faulted
+            || e.mp6.lifecycle == Mp6Lifecycle::IdentityLost
+            || (e.mp6.link_open && e.mp6.estop_latched)) {
+            ImGui::Separator();
+            ImGui::Text("Recovery");
+            if (ImGui::Button("Known physical state: reset & reconnect##mp6rec", ImVec2(-1, 26))) {
+                g_app.log(e.id, "mp6", "Explicit recovery requested: full link reconnect");
+                std::string why;
+                g_app.mp6RecoverKnownState(e, &why);
+                if (!g_app.mp6Connect(e, &why))
+                    snprintf(e.mp6.last_error, sizeof(e.mp6.last_error),
+                             "recovery reconnect failed: %s", why.c_str());
+                else
+                    snprintf(e.mp6.last_action, sizeof(e.mp6.last_action),
+                             "recovery: link reconnected; re-identify to resume");
+            }
+            ImGui::TextDisabled("Use independent physical controls to establish a known state first.\n"
+                                "SafeOff/fault states never resume in place; recovery\n"
+                                "re-attaches the link and requires a fresh Identify.");
+        }
+
+        if (e.mp6.last_error[0] != '\0') {
+            ImGui::TextColored(ImVec4(0.98f, 0.55f, 0.25f, 1.0f), "%s", e.mp6.last_error);
+        }
+
+        // ── Identity / pairing ───────────────────────────────────────
+        ImGui::Separator();
+        ImGui::Text("Identity & Pairing");
+        Mp6MetaChip("identity echo verified (type-42 byte7==3, byte9==253)", e.mp6.identity_ok);
+        Mp6MetaChip("platform pairing matched", e.mp6.paired_config);
+        ImGui::Text("Observed: board %s, platform #%d, run mode %d, OK-to-run %s",
+                    e.mp6.board_type[0] ? e.mp6.board_type : "-",
+                    e.mp6.platform_number_ob, e.mp6.runmode_ob,
+                    e.mp6.ok2run_ob ? "yes" : "no");
+        int want = e.mp6.platform_number_expected;
+        if (ImGui::InputInt("Expected platform ###mp6", &want, 0)) {
+            e.mp6.platform_number_expected = (want > 255 ? 255 : (want < 0 ? 0 : want));
+            g_app.settings_dirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Selector-1 platform number the controller must report to\n"
+                              "count as paired. Entered before connect; applied at connect.");
+
+        // ── Configuration transaction ────────────────────────────────
+        ImGui::Separator();
+        ImGui::Text("Config Transaction (command 5)");
+        if (e.mp6.sending_config) {
+            ImGui::TextColored(ImVec4(0.98f, 0.75f, 0.15f, 1.0f), "Sending config frames...");
+        }
+        ImGui::Text("Status: %s (attempts %d, expected %d frames)",
+                    e.mp6.config_send_ok ? "ConfigSendOK observed" : "not verified",
+                    e.mp6.config_attempts, e.mp6.config_count_expected);
+        Mp6MetaChip("config received bit observed (type-48)", e.mp6.config_received_ob);
+        Mp6MetaChip("AV_OK observed in status nibble", e.mp6.av_ok);
+
+        // ── Telemetry observations ───────────────────────────────────
+        ImGui::Separator();
+        ImGui::Text("Telemetry (raw / calibrated as observed)");
+        if (e.mp6.feedback_valid) {
+            if (ImGui::BeginTable("##mp6_feedback", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableSetupColumn("Axis");
+                ImGui::TableSetupColumn("Raw");
+                ImGui::TableSetupColumn("Calibrated");
+                ImGui::TableSetupColumn("Pot alarm");
+                ImGui::TableHeadersRow();
+                for (int i = 0; i < 6; i++) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::Text("%d", i);
+                    ImGui::TableNextColumn(); ImGui::Text("%d", (int)e.mp6.feedback_raw[i]);
+                    ImGui::TableNextColumn();
+                    if (e.mp6.feedback_cal[i] == SHRT_MIN)
+                        ImGui::TextDisabled("no calibration");
+                    else
+                        ImGui::Text("%d", (int)e.mp6.feedback_cal[i]);
+                    ImGui::TableNextColumn();
+                    if (e.mp6.pot_alarm[i])
+                        ImGui::TextColored(ImVec4(0.98f, 0.4f, 0.4f, 1.0f), "ALARM");
+                    else
+                        ImGui::TextUnformatted("-");
+                }
+                ImGui::EndTable();
+            }
+        } else {
+            ImGui::TextDisabled("no fresh per-axis feedback observed");
+        }
+        ImGui::Text("Supplies: %s%.2f / %.2f / %.2f V   (~3 V resolution per count)",
+                    e.mp6.supplies_valid ? "" : "(stale) ",
+                    e.mp6.supplies[0], e.mp6.supplies[1], e.mp6.supplies[2]);
+        ImGui::Text("Pressure: %s%.1f psi (aim %.1f psi)",
+                    e.mp6.pressure_valid ? "" : "(stale) ",
+                    e.mp6.pneu_psi, e.mp6.pneu_aim_psi);
+
+        // ── Controller Parameters & Pressure Plan ────────────────────────
+        ImGui::Separator();
+        ImGui::Text("Controller Parameters & Pressure Plan (NOT in .pltc)");
+        ImGui::TextWrapped("Genuine machine parameters not stored in .pltc. "
+                           "Must be explicitly supplied and validated; never guessed.");
+        Mp6MetaChip("controller settings supplied", e.mp6.controller_settings.supplied);
+
+        static std::unordered_map<int, Mp6MachineSettings> s_ui_ctrl_settings;
+        if (s_ui_ctrl_settings.find(e.id) == s_ui_ctrl_settings.end()) {
+            s_ui_ctrl_settings[e.id] = e.mp6.controller_settings;
+        }
+        Mp6MachineSettings& uis = s_ui_ctrl_settings[e.id];
+
+        ImGui::InputInt("BenchTest (0/1)", &uis.bench_test);
+        ImGui::InputInt("Comms Timeout ms", &uis.comms_timeout_ms);
+        ImGui::InputInt("Onboard Shutdown (0/1)", &uis.onboard_shutdown);
+        ImGui::InputInt("MotValFinal (63/100)", &uis.mot_val_final);
+        ImGui::InputFloat("Run Sensor Filter", &uis.sensor_filter, 0, 0, "%.4f");
+        ImGui::InputInt("Run History", &uis.history_len);
+        ImGui::InputFloat("Start Sensor Filter", &uis.sensor_filter_start, 0, 0, "%.4f");
+        ImGui::InputInt("Start History", &uis.history_len_start);
+        ImGui::InputInt("Deadband Enable (0/1)", &uis.deadband_enable);
+        ImGui::InputFloat("AV Filter", &uis.av_filter, 0, 0, "%.4f");
+        ImGui::InputInt("Limits Enable (0/1)", &uis.limits_enable);
+        ImGui::InputInt("Info Motor (1..6)", &uis.info_motor);
+        ImGui::InputInt("PID index (0..2; lifecycle selects modes)", &uis.pid_index);
+        ImGui::Checkbox("Pressure Support Enabled", &uis.pressure_enabled);
+        ImGui::Checkbox("Pressure aim supplied", &uis.pressure_aim_supplied);
+        ImGui::InputInt("Pressure aim PSI (0..150)", &uis.pressure_aim_psi);
+        ImGui::TextWrapped("Confirm each value against your machine record. Unchecked fields remain unresolved.");
+        for (unsigned i = 0; i < 16; ++i) {
+            bool confirmed = (uis.explicit_fields & (1u << i)) != 0;
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::Checkbox(mp6MachineSettingNames[i], &confirmed)) {
+                if (confirmed) uis.explicit_fields |= 1u << i;
+                else uis.explicit_fields &= ~(1u << i);
+            }
+            ImGui::PopID();
+        }
+
+        bool active_motion_settings = g_app.mp6IsMotorPowerRequested(e) ||
+                                       (e.mp6.lifecycle == Mp6Lifecycle::Configuring ||
+                                       e.mp6.lifecycle == Mp6Lifecycle::Initializing ||
+                                       e.mp6.lifecycle == Mp6Lifecycle::Running ||
+                                       e.mp6.lifecycle == Mp6Lifecycle::Parking);
+
+        if (g_app.mp6IsMotorPowerRequested(e)) {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                "Motors are currently enabled (%s). Shut down first to change configuration or settings.",
+                mp6LifecycleToString(e.mp6.lifecycle));
+        }
+
+        if (active_motion_settings) ImGui::BeginDisabled();
+        if (ImGui::Button("Apply Controller Settings##mp6")) {
+            std::string why;
+            if (!g_app.mp6SetControllerSettings(e, uis, &why)) {
+                snprintf(e.mp6.last_error, sizeof(e.mp6.last_error), "%s", why.c_str());
+            }
+        }
+        if (active_motion_settings) ImGui::EndDisabled();
+
+        // ── Platform config import ───────────────────────────────────
+        ImGui::Separator();
+        ImGui::Text("Platform Configuration (.pltc)");
+        ImGui::TextWrapped("Import the recovered PlatformConfig.pltc text. It is stored "
+                           "verbatim; the mp6_config module will parse and validate it "
+                           "and only then can the command-5 transaction run.");
+        static char s_pltc_path[512] = "";
+        ImGui::SetNextItemWidth(340);
+        ImGui::InputText("##pltc_path", s_pltc_path, sizeof(s_pltc_path));
+        ImGui::SameLine();
+        static std::unordered_map<int, std::vector<char>> s_import_buffers;
+        std::vector<char>& imp = s_import_buffers[e.id];
+        if (imp.size() < sizeof(e.mp6.platform_config_text))
+            imp.resize(sizeof(e.mp6.platform_config_text), '\0');
+        if (ImGui::SmallButton("Load file##pltc") && s_pltc_path[0]) {
+            FILE* f = fopen(s_pltc_path, "rb");
+            if (f) {
+                std::string file_text;
+                char rbuf[4096];
+                size_t r;
+                while ((r = fread(rbuf, 1, sizeof(rbuf), f)) > 0) file_text.append(rbuf, r);
+                fclose(f);
+                if (file_text.size() < imp.size())
+                    snprintf(imp.data(), imp.size(), "%s", file_text.c_str());
+                else
+                    snprintf(imp.data(), imp.size(), "(file too large for the 8 KB import buffer)");
+            } else {
+                snprintf(imp.data(), imp.size(), "(cannot open file: %s)", s_pltc_path);
+            }
+        }
+        ImGui::InputTextMultiline("##pltc_text", imp.data(), imp.size(),
+                                  ImVec2(-1, 120));
+        if (active_motion_settings) ImGui::BeginDisabled();
+        if (ImGui::Button("Import text##pltc")) {
+            std::string why;
+            g_app.mp6ImportPlatformConfigText(e, imp.data(), &why);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear import##pltc")) {
+            g_app.mp6ImportPlatformConfigText(e, "", nullptr);
+            imp.assign(imp.size(), '\0');
+        }
+        if (active_motion_settings) ImGui::EndDisabled();
+        ImGui::TextWrapped("%s", e.mp6.config_note);
+        Mp6MetaChip("platform config imported & validated (needs mp6_config module)", e.mp6.config_ready);
+
+        // MaxPPS materialization input: the cmd-5 MaxPPS is a required
+        // parameter (engine refuses "derivable but not materialized"). When
+        // the .pltc carries the "Max Motor RPM" row it is machine data and
+        // wins; this explicit entry is used only when the row is absent.
+        ImGui::PushID("mp6maxrpm");
+        float rpm_prev = e.mp6.max_rpm_entry;
+            ImGui::InputFloat("Max Motor RPM (entry; used when .pltc lacks the row)",
+                              &e.mp6.max_rpm_entry, 1.0f, 10.0f, "%.1f");
+            if (e.mp6.max_rpm_entry != rpm_prev && e.mp6.platform_config_present)
+                g_app.mp6ImportPlatformConfigText(e, e.mp6.platform_config_text, nullptr);
+            ImGui::TextDisabled("MaxPPS is materialized at import: round(MaxRPM*StepRev/60)\n"
+                                "(snapshot: 230*3200/60 -> 12267). No clamping — the\n"
+                                "session's param-34 wire range is the real check.");
+        ImGui::PopID();
+
+        // ── Design radii (the missing machine constants) ─────────────
+        ImGui::Separator();
+        ImGui::Text("Design Attachment Geometry (NOT in .pltc)");
+        ImGui::Checkbox("Design radii supplied##mp6", &e.mp6.design.supplied);
+        if (!e.mp6.design.supplied)
+            ImGui::TextColored(ImVec4(0.98f, 0.75f, 0.15f, 1.0f),
+                "Design BotB/TopB radii are not in the .pltc file and are not\n"
+                "prefilled from the recovered reference rig. Motion stays blocked.");
+        ImGui::PushID("mp6design");
+        ImGui::DragFloat("Base radius (BotB)", &e.mp6.design.base_radius_mm, 0.25f, 10.0f, 2000.0f, "%.1f mm");
+        ImGui::DragFloat("Platform radius (TopB)", &e.mp6.design.platform_radius_mm, 0.25f, 10.0f, 2000.0f, "%.1f mm");
+        ImGui::DragFloat("X offset", &e.mp6.design.x_offset_mm, 0.25f, -1000.0f, 1000.0f, "%.1f mm");
+        ImGui::PopID();
+
+        // ── Readiness checklist ──────────────────────────────────────
+        ImGui::Separator();
+        ImGui::Text("Readiness (all observation-verified)");
+        Mp6MetaChip("link open", e.mp6.link_open);
+        Mp6MetaChip("identity verified", e.mp6.identity_ok);
+        Mp6MetaChip("platform config imported & validated", e.mp6.config_ready);
+        Mp6MetaChip("design radii supplied", e.mp6.design.supplied);
+        Mp6MetaChip("pairing matched", e.mp6.paired_config);
+        Mp6MetaChip("config transaction verified (ConfigSendOK)", e.mp6.config_send_ok);
+        Mp6MetaChip("AV_OK observed", e.mp6.av_ok);
+        Mp6MetaChip("step targets available (needs mp6_geometry module)", e.mp6.step_target_valid);
+        ImGui::TextDisabled("Motion output streams command-2 targets when solver is ready\n"
+                            "and session is Running or Parked.");
+    }
+    ImGui::PopID();
+}
+
 static void DrawEntitySettingsContent(Entity& e) {
     ImGui::PushID(e.id + 1000);
     {
@@ -2999,6 +3726,11 @@ static void DrawEntitySettingsContent(Entity& e) {
         // Connection (HIL-specific)
         if (e.type == EntityType::HIL) {
             ImGui::Separator();
+            if (e.hil_backend == HilBackend::MP6) {
+                // MP6 (Motum Mega) device card — completely separate transport,
+                // lifecycle and import flow from the ESP32/COBS path below.
+                DrawMp6SettingsContent(e);
+            } else {
             ImGui::Text("ESP32 Connection");
 
             bool connected = e.serial && e.serial->isOpen();
@@ -3514,6 +4246,7 @@ static void DrawEntitySettingsContent(Entity& e) {
                     ImGui::TextDisabled("Connect to an ESP32 to auto-pair.");
                 }
             }
+            } // end ESP32-only connection block (MP6 handled above)
         }
 
         // Rates (read-only)
@@ -3521,6 +4254,8 @@ static void DrawEntitySettingsContent(Entity& e) {
         ImGui::Text("Rates");
         if (e.type == EntityType::SIL) {
             ImGui::Text("IK: %.0f Hz", e.rate_ik_hz);
+        } else if (e.hil_backend == HilBackend::MP6) {
+            ImGui::Text("TX: %.0f Hz | Tel: %d type-48/s", e.rate_tx_hz, e.mp6.tel_hz_est);
         } else {
             bool hil_connected = e.serial && e.serial->isOpen();
             if (hil_connected) {
@@ -5679,8 +6414,8 @@ static void DrawEntityConsoleContent(Entity& e) {
             ImGui::Text("Workspace: %.0f%%", e.state.max_util);
         }
 
-        // ── HIL TX raw values ──
-        if (e.type == EntityType::HIL) {
+        // ── HIL TX raw values (ESP32 backend only) ──
+        if (e.type == EntityType::HIL && e.hil_backend == HilBackend::ESP32) {
             if (ImGui::CollapsingHeader("HIL TX Raw")) {
                 float col_w = ImGui::GetContentRegionAvail().x * 0.33f;
                 for (int i = 0; i < 6; i++) {
@@ -5699,6 +6434,67 @@ static void DrawEntityConsoleContent(Entity& e) {
                 } else {
                     ImGui::TextDisabled("Not connected");
                 }
+            }
+        }
+
+        // ── MP6 observations (MP6 backend only) ──
+        if (e.type == EntityType::HIL && e.hil_backend == HilBackend::MP6) {
+            if (ImGui::CollapsingHeader("MP6 Telemetry", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Text("Type-48: %d/s | TX: %.0f Hz | cadence %d Hz",
+                            e.mp6.tel_hz_est, e.rate_tx_hz, e.mp6.cmd2_hz);
+                ImGui::Text("Identity: %s | Pairing: %s (board %s)",
+                            e.mp6.identity_ok ? "verified" : "unknown",
+                            e.mp6.paired_config ? "matched" : "unmatched",
+                            e.mp6.board_type[0] ? e.mp6.board_type : "-");
+                ImGui::Text("Run mode: %d | OK-to-run: %s | Config-recv: %s | AV_OK: %s",
+                            e.mp6.runmode_ob, e.mp6.ok2run_ob ? "yes" : "no",
+                            e.mp6.config_received_ob ? "yes" : "no", e.mp6.av_ok ? "yes" : "no");
+                ImGui::TextColored(e.mp6.fault_latched ? ImVec4(0.98f, 0.4f, 0.4f, 1.0f)
+                                                       : ImVec4(0.6f, 0.6f, 0.65f, 1.0f),
+                                   "Fault: %s (code %u)",
+                                   e.mp6.fault_latched ? "LATCHED" : "none",
+                                   (unsigned)e.mp6.fault_code);
+                ImGui::TextWrapped("%s", e.mp6.lifecycle_note);
+            }
+            if (ImGui::CollapsingHeader("MP6 Feedback")) {
+                if (e.mp6.feedback_valid) {
+                    float col_w = ImGui::GetContentRegionAvail().x * 0.5f;
+                    for (int i = 0; i < 6; i++) {
+                        if (i % 2 != 0) ImGui::SameLine(col_w + 8);
+                        if (e.mp6.feedback_cal[i] != SHRT_MIN)
+                            ImGui::Text("[%d] raw %d  cal %d%s", i,
+                                        (int)e.mp6.feedback_raw[i], (int)e.mp6.feedback_cal[i],
+                                        e.mp6.pot_alarm[i] ? "  ALARM" : "");
+                        else
+                            ImGui::Text("[%d] raw %d  cal --", i, (int)e.mp6.feedback_raw[i]);
+                    }
+                } else {
+                    ImGui::TextDisabled("no fresh per-axis feedback observed");
+                }
+                ImGui::Text("Supplies: %.2f / %.2f / %.2f V (~3 V/count)%s",
+                            e.mp6.supplies[0], e.mp6.supplies[1], e.mp6.supplies[2],
+                            e.mp6.supplies_valid ? "" : " (stale)");
+                ImGui::Text("Pressure: %.1f psi (aim %.1f)%s", e.mp6.pneu_psi,
+                            e.mp6.pneu_aim_psi, e.mp6.pressure_valid ? "" : " (stale)");
+            }
+            if (ImGui::CollapsingHeader("MP6 Targets")) {
+                ImGui::Text("Step targets (command 2): %s",
+                            e.mp6.step_target_valid ? "computed" : "unavailable — mp6_geometry module pending");
+                ImGui::Text("Pipeline pose: %s", e.mp6.target_pose_valid ? "valid" : "invalid");
+                if (e.mp6.target_pose_valid) {
+                    float col_w = ImGui::GetContentRegionAvail().x * 0.5f;
+                    const char* ch[] = { "x", "y", "z", "roll", "pitch", "yaw" };
+                    const char* u[] = { "mm", "mm", "mm", "rad", "rad", "rad" };
+                    for (int i = 0; i < 6; i++) {
+                        if (i % 2 != 0) ImGui::SameLine(col_w + 8);
+                        if (i < 3)
+                            ImGui::Text("%s: %+7.1f %s", ch[i], e.mp6.target_pose[i], u[i]);
+                        else
+                            ImGui::Text("%s: %+6.3f %s", ch[i], e.mp6.target_pose[i], u[i]);
+                    }
+                }
+                ImGui::TextDisabled("Targets are the modelled post-cue pose; they are\n"
+                                    "never presented as measured feedback.");
             }
         }
 
@@ -6867,11 +7663,17 @@ static void DrawDataStreamsPanel() {
                         ImGui::Text("S%d", s);
                         float mn = 1e9f, mx = -1e9f;
                         for (auto& e : g_app.entities) {
+                            ImGui::TableNextColumn();
+                            ImVec4 col = ColorFromFloat4(e.color);
+                            if (e.type == EntityType::HIL && e.hil_backend == HilBackend::MP6) {
+                                // Servo angles do not exist on the rotary MP6
+                                // backend; showing a number would fabricate it.
+                                ImGui::TextColored(col, "MP6");
+                                continue;
+                            }
                             float deg = e.state.output_angles_deg[s];
                             if (deg < mn) mn = deg;
                             if (deg > mx) mx = deg;
-                            ImGui::TableNextColumn();
-                            ImVec4 col = ColorFromFloat4(e.color);
                             ImGui::TextColored(col, "%.1f\xc2\xb0", deg);
                         }
                         ImGui::TableNextColumn();
@@ -6953,12 +7755,23 @@ static void DrawDataStreamsPanel() {
                 static int chart_mode = 0;
                 ImGui::RadioButton("Input (Global)", &chart_mode, 0);
                 ImGui::SameLine();
-                ImGui::RadioButton("Servo Angles", &chart_mode, 1);
+                ImGui::RadioButton("Servo Angles / Feedback", &chart_mode, 1);
                 ImGui::SameLine();
                 ImGui::RadioButton("Scaled Input", &chart_mode, 2);
 
                 const char* axis_names[] = {"Surge", "Sway", "Heave", "Roll", "Pitch", "Yaw"};
                 const char* y_labels[] = {"Input (%)", "Angle (deg)", "Physical"};
+                if (chart_mode == 1) {
+                    // MP6 entities feed calibrated feedback steps (NaN gaps),
+                    // not servo angles — never label their channel in degrees.
+                    bool any_mp6 = false, any_other = false;
+                    for (auto& e2 : g_app.entities) {
+                        if (!e2.enabled || e2.type != EntityType::HIL) continue;
+                        if (e2.hil_backend == HilBackend::MP6) any_mp6 = true;
+                        else any_other = true;
+                    }
+                    if (any_mp6) y_labels[1] = any_other ? "deg / steps" : "Feedback (steps)";
+                }
 
                 // Show all 6 axes on one plot, or per-axis tabs
                 static bool overlay_all = true;

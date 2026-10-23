@@ -330,11 +330,119 @@ def stewart_entities() -> dict:
 
 
 @mcp.tool()
-def stewart_add_entity(name: str, type: str = "SIL") -> dict:
-    """Add SIL or HIL entity. HIL is forced offline in documentation mode."""
+def stewart_add_entity(name: str, type: str = "SIL", backend: str = "esp32") -> dict:
+    """Add SIL or HIL entity. HIL is forced offline in documentation mode.
+
+    backend: \"esp32\" (default COBS HIL, backward-compatible) or \"mp6\"
+    (Motum Mega onboard-control HIL; a separate raw-serial path).
+    """
     if type not in ("SIL", "HIL"):
         raise ValueError("type must be SIL or HIL")
-    return _call("entity_add", {"name": name, "type": type})
+    if backend not in ("esp32", "mp6"):
+        raise ValueError("backend must be esp32 or mp6")
+    return _call("entity_add", {"name": name, "type": type, "backend": backend})
+
+
+@mcp.tool()
+def stewart_mp6_status(entity: int | None = None) -> dict:
+    """Observed MP6 (Motum Mega) backend state for one entity.
+
+    Reports mirrored observation only (lifecycle, identity, pairing, config
+    transaction, design radii, fault latch, telemetry rates); no device I/O.
+    """
+    args = {} if entity is None else {"entity": entity}
+    return _call("mp6_status", args)
+
+
+@mcp.tool()
+def stewart_mp6_connect(entity: int | None = None, port: str | None = None) -> dict:
+    """Open the raw MP6 serial link (115200 8N1; never COBS).
+
+    Refused in documentation mode. May auto-create an MP6 HIL entity.
+    """
+    args = {} if entity is None else {"entity": entity}
+    if port is not None:
+        args["port"] = port
+    return _call("mp6_connect", args)
+
+
+@mcp.tool()
+def stewart_mp6_disconnect(entity: int) -> dict:
+    """Close the app-side MP6 link; the controller is left as-is (unverified)."""
+    return _call("mp6_disconnect", {"entity": entity})
+
+
+@mcp.tool()
+def stewart_mp6_command(entity: int, intent: str) -> dict:
+    """Stage one MP6 lifecycle intent: identify|configure|initialize|start|stop|park|shutdown|disconnect.
+
+    Acceptance only stages the intent; the mp6 session engine dispatches it and
+    the observed telemetry confirms (or names the refusal). Nothing is claimed
+    successful by the staging call itself.
+    """
+    return _call("mp6_command", {"entity": entity, "intent": intent})
+
+
+@mcp.tool()
+def stewart_mp6_config_import(entity: int, text: str = "") -> dict:
+    """Import (or clear with empty string) the PlatformConfig.pltc text.
+
+    The app parses and derives calibration/inputs; the session reports any
+    outcome. Design attachment radii are NOT in this file and stay explicit
+    entity settings.
+    """
+    return _call("mp6_config_import", {"entity": entity, "text": text})
+
+
+@mcp.tool()
+def stewart_mp6_recover_known_state(entity: int, physical_state_confirmed: bool) -> dict:
+    """After independent physical controls establish a known state, reset and disconnect.
+
+    A later explicit connect still requires fresh Identify, Configure and Initialize.
+    """
+    return _call("mp6_recover_known_state", {"entity": entity,
+                 "physical_state_confirmed": physical_state_confirmed})
+
+
+@mcp.tool()
+def stewart_mp6_controller_settings(
+    entity: int,
+    pid_index: int | None = None,
+    comms_timeout_ms: int | None = None,
+    pressure_enabled: bool | None = None,
+    pressure_aim_psi: int | None = None,
+    sensor_filter: float | None = None,
+    av_filter: float | None = None,
+    history_len: int | None = None,
+    mot_val_final: int | None = None,
+    bench_test: int | None = None,
+    onboard_shutdown: int | None = None,
+    deadband_enable: int | None = None,
+    limits_enable: int | None = None,
+    info_motor: int | None = None,
+    sensor_filter_start: float | None = None,
+    history_len_start: int | None = None,
+    pressure_aim_supplied: bool | None = None,
+) -> dict:
+    """Set genuine machine controller parameters and pressure plan not in .pltc."""
+    args: dict = {"entity": entity}
+    if pid_index is not None: args["pid_index"] = pid_index
+    if comms_timeout_ms is not None: args["comms_timeout_ms"] = comms_timeout_ms
+    if pressure_enabled is not None: args["pressure_enabled"] = pressure_enabled
+    if pressure_aim_psi is not None: args["pressure_aim_psi"] = pressure_aim_psi
+    if sensor_filter is not None: args["sensor_filter"] = sensor_filter
+    if av_filter is not None: args["av_filter"] = av_filter
+    if history_len is not None: args["history_len"] = history_len
+    if mot_val_final is not None: args["mot_val_final"] = mot_val_final
+    if bench_test is not None: args["bench_test"] = bench_test
+    if onboard_shutdown is not None: args["onboard_shutdown"] = onboard_shutdown
+    if deadband_enable is not None: args["deadband_enable"] = deadband_enable
+    if limits_enable is not None: args["limits_enable"] = limits_enable
+    if info_motor is not None: args["info_motor"] = info_motor
+    if sensor_filter_start is not None: args["sensor_filter_start"] = sensor_filter_start
+    if history_len_start is not None: args["history_len_start"] = history_len_start
+    if pressure_aim_supplied is not None: args["pressure_aim_supplied"] = pressure_aim_supplied
+    return _call("mp6_controller_settings", args)
 
 
 @mcp.tool()

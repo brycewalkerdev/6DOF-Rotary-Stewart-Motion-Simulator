@@ -129,6 +129,8 @@ Use `stewart_wait_frames(frames=3)` and then read `stewart_ui_get()` again. Befo
 
 `stewart_raw(cmd, args)` exposes commands reported by `stewart_capabilities`; it does not bypass documentation-mode guards. Discover current capabilities before using raw commands.
 
+Dedicated MP6 backend verbs include `mp6_status`, `mp6_connect`, `mp6_disconnect`, `mp6_command`, `mp6_config_import`, `mp6_controller_settings`, and `mp6_recover_known_state`. Real connects and lifecycle commands are refused in documentation mode; validated host configuration staging remains available. Status reads mirror internal state. Known-state recovery requires explicit physical-state confirmation and does not reconnect, identify, or re-arm. See [MP6 backend](MP6.md).
+
 For example, the MCP calls `stewart_raw("ping")` and `stewart_raw("ui_get")` correspond to these newline-delimited requests on the selected loopback TCP port:
 
 ```json

@@ -9,6 +9,21 @@
 #include <atomic>
 #include <thread>
 #include <memory>
+#include <unordered_map>
+
+namespace mp6 {
+    class Link;
+    class Session;
+    struct ControllerConfig;
+    struct Calibration;
+    struct PressurePlan;
+    struct PidProfile;
+    struct Mp6PlatformConfig;
+    struct Mp6DesignParams;
+    struct Mp6GeometrySetup;
+    struct Mp6Pose;
+    struct StepTarget;
+}
 
 // History ring buffer size (seconds × expected Hz)
 static const int HISTORY_LEN = 600;   // ~10s at 60fps
@@ -160,6 +175,239 @@ struct DeviceParams {
 
 // ── Entity ──────────────────────────────────────────────────────────
 
+
+// MP6 (Motum Mega rotary Stewart)
+
+enum class HilBackend {
+    ESP32 = 0,
+    MP6 = 1
+};
+
+enum class Mp6Lifecycle {
+    Disconnected,
+    Connecting,
+    Identifying,
+    Identified,
+    Configuring,
+    Configured,
+    Parked,
+    Docked,
+    Initializing,
+    Running,
+    Parking,
+    Faulted,
+    IdentityLost,
+    SafeOff,
+    Unknown
+};
+inline const char* mp6LifecycleToString(Mp6Lifecycle lc) {
+    switch (lc) {
+        case Mp6Lifecycle::Disconnected: return "Disconnected";
+        case Mp6Lifecycle::Connecting:   return "Connecting";
+        case Mp6Lifecycle::Identifying:  return "Identifying";
+        case Mp6Lifecycle::Identified:   return "Stopped / Identified";
+        case Mp6Lifecycle::Configuring:  return "Configuring";
+        case Mp6Lifecycle::Configured:   return "Configured";
+        case Mp6Lifecycle::Parked:       return "Parked";
+        case Mp6Lifecycle::Docked:       return "Docked";
+        case Mp6Lifecycle::Initializing: return "Initializing";
+        case Mp6Lifecycle::Running:      return "Running";
+        case Mp6Lifecycle::Parking:      return "Parking";
+        case Mp6Lifecycle::Faulted:      return "Faulted";
+        case Mp6Lifecycle::IdentityLost: return "IdentityLost";
+        case Mp6Lifecycle::SafeOff:      return "SafeOff";
+        default:                         return "Unknown";
+    }
+}
+
+
+enum class Mp6Intent {
+    None,
+    Identify,
+    Configure,
+    Initialize,
+    Start,
+    Stop,
+    Park,
+    Shutdown,
+    Estop,
+    Disconnect
+};
+
+struct Mp6MachineSettings {
+    // One bit for each explicitly entered field, in mp6MachineSettingNames order.
+    static constexpr uint32_t all_fields = (1u << 16) - 1;
+    uint32_t explicit_fields = 0;
+    bool  supplied = false;
+    int   bench_test = 0;
+    int   comms_timeout_ms = 1000;
+    int   onboard_shutdown = 1;
+    int   mot_val_final = 63;
+    float sensor_filter = 0.20f;
+    int   history_len = 4;
+    float sensor_filter_start = 0.15f;
+    int   history_len_start = 3;
+    int   deadband_enable = 0;
+    float av_filter = 0.0f;
+    int   limits_enable = 1;
+    int   info_motor = 1;
+    int   pid_index = 0;
+    bool  pressure_enabled = false;
+    bool  pressure_aim_supplied = false;
+    int   pressure_aim_psi = 0;
+};
+
+inline constexpr const char* mp6MachineSettingNames[] = {
+    "bench_test", "comms_timeout_ms", "onboard_shutdown", "mot_val_final",
+    "sensor_filter", "history_len", "sensor_filter_start", "history_len_start",
+    "deadband_enable", "av_filter", "limits_enable", "info_motor", "pid_index",
+    "pressure_enabled", "pressure_aim_supplied", "pressure_aim_psi"
+};
+
+struct Mp6DesignState {
+    char  design_name[64] = "";
+    bool  supplied = false;
+    float bot_a_mm = 0.0f;
+    float bot_b_mm = 0.0f;
+    float top_a_mm = 0.0f;
+    float top_b_mm = 0.0f;
+    float crank_length_mm = 0.0f;
+    float rod_length_mm = 0.0f;
+    float off_x_mm = 0.0f;
+    float pcdx_mm = 0.0f;
+    float pcdy_mm = 0.0f;
+    float z_off_mm = 0.0f;
+    float angle_offset_deg = 0.0f;
+    float base_radius_mm = 0.0f;
+    float platform_radius_mm = 0.0f;
+    float x_offset_mm = 0.0f;
+    float point_zero_x_mm = 0.0f;
+    float point_zero_z_mm = 0.0f;
+    float base_z_mm[6] = {};
+    float top_z_mm[6] = {};
+    int   pivot_z_provenance = 0; // 0=kUnreviewed, 1=kFixtureOnly, 2=kReviewed
+    bool  pivot_z_pending_review = false;
+    bool  point_zero_supplied = false;
+    bool  stale_older_config = false;
+};
+
+struct Mp6VizState {
+    bool   solver_ready = false;
+    bool   rod_lines_valid = false;
+    bool   axis_ok[6] = {};
+    float  base_pivot[6][3] = {};
+    float  crank_joint[6][3] = {};
+    float  rod_top[6][3] = {};
+    float  calc_residual_mm[6] = {};
+};
+
+enum class Mp6ReviewAction { MarkPivots, ConfirmPivots, ResetPivots, ConfirmPointZeros };
+inline bool mp6CanConfirmPivots(const Mp6DesignState& d) {
+    return d.pivot_z_pending_review && d.pivot_z_provenance != 2;
+}
+inline bool mp6ReviewDesign(Mp6DesignState& d, Mp6ReviewAction action) {
+    switch (action) {
+    case Mp6ReviewAction::MarkPivots:
+        if (d.pivot_z_provenance == 2) return false;
+        d.pivot_z_pending_review = true; return true;
+    case Mp6ReviewAction::ConfirmPivots:
+        if (!mp6CanConfirmPivots(d)) return false;
+        d.pivot_z_provenance = 2; d.pivot_z_pending_review = false; return true;
+    case Mp6ReviewAction::ResetPivots:
+        d.pivot_z_provenance = 0; d.pivot_z_pending_review = false; return true;
+    case Mp6ReviewAction::ConfirmPointZeros:
+        d.point_zero_supplied = true; return true;
+    }
+    return false;
+}
+
+struct Mp6BackendState {
+    Mp6Lifecycle       lifecycle = Mp6Lifecycle::Disconnected;
+    Mp6Intent          pending_intent = Mp6Intent::None;
+    bool               link_open = false;
+    char               link_port[32] = "";
+    int                link_baud = 115200;
+    bool               auto_connect = false;
+    bool               link_read_failed = false;
+    double             last_connect_attempt = 0.0;
+    int                cmd2_hz = 60; // Evidenced 60 Hz contract
+
+    bool               identity_ok = false;
+    bool               paired_config = false;
+    char               board_type[16] = "";
+    int                platform_number_expected = 1;
+    int                platform_number_ob = 0;
+    int                runmode_ob = 0;
+    bool               ok2run_ob = false;
+
+    bool               sending_config = false;
+    bool               config_ready = false;
+    bool               config_send_ok = false;
+    bool               config_received_ob = false;
+    int                config_attempts = 0;
+    int                config_count_expected = 22;
+    int                config_params_transmitted = 0;
+    int                config_params_ack = 0;
+    char               config_note[256] = "";
+
+    bool               av_ok = false;
+    bool               onboard_control = false;
+    bool               feedback_valid = false;
+    int16_t            feedback_raw[6] = {};
+    int16_t            feedback_cal[6] = {};
+    bool               pot_alarm[6] = {};
+    bool               supplies_valid = false;
+    float              supplies[3] = {};
+    bool               pressure_valid = false;
+    float              pneu_psi = 0.0f;
+    float              pneu_aim_psi = 0.0f;
+
+    bool               platform_config_present = false;
+    char               platform_config_text[8192] = "";
+    float              max_rpm_entry = 0.0f;
+
+    Mp6MachineSettings controller_settings;
+    Mp6DesignState     design;
+    Mp6VizState        viz;
+
+    bool               step_target_valid = false;
+    int32_t            step_target[6] = {};
+    bool               target_pose_valid = false;
+    float              target_pose[6] = {};
+    bool               feedback_pose_valid = false;
+    float              feedback_pose[6] = {};
+
+    uint64_t           tel_seq = 0;
+    int                tel_hz_est = 0;
+    uint64_t           missed_cadence_slots = 0;
+    double             achieved_target_hz = 0.0;
+    bool               cadence_normalised = false;
+    bool               shutdown_pending = false;
+    int                applied_pid_mode = -1;
+
+    bool               ramp_active = false;
+    int32_t            ramp_start[6] = {};
+    int32_t            ramp_current[6] = {};
+    int32_t            ramp_goal[6] = {};
+    int                ramp_phase = 0;
+    int                ramp_duration_ms = 0;
+    int                ramp_timeout_ms = 0;
+    bool               ramp_endpoint_reached = false;
+    bool               ramp_settled = false;
+
+    bool               fault_latched = false;
+    uint16_t           fault_code = 0;
+    char               fault_text[128] = "";
+    bool               estop_latched = false;
+
+    char               last_error[192] = "";
+    char               last_action[64] = "";
+    char               lifecycle_note[256] = "";
+    char               solver_note[128] = "";
+};
+
+using Mp6EntityState = Mp6BackendState;
+
 struct Entity {
     int             id;
     char            name[64];
@@ -260,6 +508,9 @@ struct Entity {
     float           dyn_transition_from[6];             // snapshot of scaled_pct before apply
 
     void            pushHistory(double t);              // record current state
+    // MP6 (Motum Mega raw serial backend)
+    HilBackend      hil_backend = HilBackend::ESP32;
+    Mp6BackendState mp6;
 };
 
 // ── Recording / Playback ───────────────────────────────────────────
@@ -442,7 +693,27 @@ struct App {
     App();
     ~App();
 
-    Entity& addEntity(const char* name, EntityType type);
+    // MP6 runtime state (main update thread only)
+    struct Mp6Runtime;
+    std::unordered_map<int, std::unique_ptr<Mp6Runtime>> mp6_runtimes;
+
+    Entity& addEntity(const char* name, EntityType type, HilBackend backend = HilBackend::ESP32);
+    bool    mp6Connect(Entity& e, std::string* error);
+    bool    mp6ConnectWithLink(Entity& e, std::unique_ptr<mp6::Link> link, std::string* error);
+    void    mp6Disconnect(Entity& e);
+    bool    mp6Command(Entity& e, Mp6Intent intent, std::string* error);
+    bool    mp6ImportPlatformConfigText(Entity& e, const char* text, std::string* error);
+    bool    mp6RefreshDesignGeometry(Entity& e, std::string* error);
+    bool    mp6AcceptDesign(Entity& e, const Mp6DesignState& draft, std::string* error);
+    bool    mp6RecoverKnownState(Entity& e, std::string* error);
+    bool    mp6SetControllerSettings(Entity& e, const Mp6MachineSettings& settings, std::string* error);
+    bool    mp6ValidateMachineSettings(const Mp6MachineSettings& settings, std::string* error);
+    bool    mp6IsMotorPowerRequested(const Entity& e) const;
+    bool    mp6InvalidateAuthority(Entity& e, bool invalidate_config, bool invalidate_geometry);
+    void    mp6UpdateEntity(Entity& e);
+    void    startMotion();
+    void    stopMotion();
+    void    requestEstop();
     void    removeEntity(int id);
     Entity* findEntity(int id);
     void    log(int entity_id, const char* source, const char* fmt, ...);
