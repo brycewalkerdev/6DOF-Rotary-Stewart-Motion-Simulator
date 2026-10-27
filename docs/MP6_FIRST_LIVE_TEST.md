@@ -35,7 +35,7 @@ UI click as proof of the machine's state.
 - [ ] The original MotSim installation is intact and still drives the rig
       normally (it is the fallback and the reference). Record its version.
 - [ ] Platform is docked (fully down) and the struts are vented before starting.
-- [ ] Build is current: `mp6` at or after `2a3ef38`; Release build and CTest 6/6
+- [ ] Build is current: `mp6` at or after the commit that adds this checklist; Release build and CTest 6/6
       pass on this PC (commands in [MP6 § build](MP6.md)).
 
 ## Phase 1 — Collect the real machine data
@@ -46,6 +46,14 @@ recovered reference snapshot in `motum_resources/`.
 
 - [ ] This rig's `PlatformConfig.pltc` (StepRev, pot tables, gear ratios,
       accel/decel, Max Motor RPM).
+      A read-only snapshot of this rig's installed MotSim resources (taken while
+      MotSim was running; no serial port opened) is in the sibling repo
+      `motsim-artifacts` (`motsim-config-2026-10-27-59a2b534/`): `PlatformConfig.pltc`,
+      the eleven selected MotConv profiles, a derived six-axis calibration and
+      SHA-256 hashes. Its `PlatformConfig.pltc` is byte-identical to the
+      repository snapshot (crank 230, rod 645, Z offset 506, 3200 steps/rev,
+      6 x 20:1, travel +/-0.9 rad). It does **not** contain pivot z, controller
+      settings or platform pairing, which still need to be collected below.
 - [ ] Platform number expected from the controller's identity (pairing).
 - [ ] Design geometry: BotA, BotB, TopA, TopB, crank and rod lengths, ZOff/X
       offset for this platform design.
