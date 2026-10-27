@@ -3673,16 +3673,15 @@ static void DrawMp6SettingsContent(Entity& e) {
         // ── Design radii (the missing machine constants) ─────────────
         ImGui::Separator();
         ImGui::Text("Design Attachment Geometry (NOT in .pltc)");
-        ImGui::Checkbox("Design radii supplied##mp6", &e.mp6.design.supplied);
+        ImGui::Text("Design radii supplied: %s", e.mp6.design.supplied ? "yes" : "no");
         if (!e.mp6.design.supplied)
             ImGui::TextColored(ImVec4(0.98f, 0.75f, 0.15f, 1.0f),
                 "Design BotB/TopB radii are not in the .pltc file and are not\n"
                 "prefilled from the recovered reference rig. Motion stays blocked.");
-        ImGui::PushID("mp6design");
-        ImGui::DragFloat("Base radius (BotB)", &e.mp6.design.base_radius_mm, 0.25f, 10.0f, 2000.0f, "%.1f mm");
-        ImGui::DragFloat("Platform radius (TopB)", &e.mp6.design.platform_radius_mm, 0.25f, 10.0f, 2000.0f, "%.1f mm");
-        ImGui::DragFloat("X offset", &e.mp6.design.x_offset_mm, 0.25f, -1000.0f, 1000.0f, "%.1f mm");
-        ImGui::PopID();
+        ImGui::Text("Base radius (BotB): %.1f mm", e.mp6.design.bot_b_mm);
+        ImGui::Text("Platform radius (TopB): %.1f mm", e.mp6.design.top_b_mm);
+        ImGui::Text("X offset: %.1f mm", e.mp6.design.off_x_mm);
+        ImGui::TextDisabled("Edit geometry in Platform Setup using its guarded draft and Apply.");
 
         // ── Readiness checklist ──────────────────────────────────────
         ImGui::Separator();

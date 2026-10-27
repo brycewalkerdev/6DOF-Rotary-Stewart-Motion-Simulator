@@ -578,6 +578,18 @@ void testReadiness() {
     issues.clear();
     CHECK(mp6::mp6_ready_for_onboard_config(cfg, &issues,
                                             mp6::PivotProvenance::kReviewed));
+    cfg.step_rev.value = 3200.6;
+    cfg.max_pps = 12270;
+    issues.clear();
+    CHECK(mp6::mp6_ready_for_onboard_config(cfg, &issues,
+                                            mp6::PivotProvenance::kReviewed));
+    cfg.max_pps = 12269;
+    issues.clear();
+    CHECK(!mp6::mp6_ready_for_onboard_config(cfg, &issues,
+                                             mp6::PivotProvenance::kReviewed));
+    cfg.step_rev.value = 3200;
+    cfg.max_pps = 12267;
+    issues.clear();
     // Inconsistent materialization must also block.
     cfg.max_pps = 12266;
     issues.clear();
@@ -608,6 +620,21 @@ void testCalibration() {
     CHECK(mp6::Mp6PlatformConfig::from_pltc(snapshotText(), cfg));
     mp6::Mp6AxisCalibration cal[mp6::kAxes];
     std::string err;
+    CHECK(mp6::mp6_config_derive_calibration(cfg, cal, &err));
+    CHECK_EQ(mp6::mp6_normalize_pot_lo(3543.75), 3544);
+    CHECK_EQ(mp6::mp6_normalize_pot_lo(3543.5), 3544);
+    CHECK_EQ(mp6::mp6_normalize_pot_lo(3544.5), 3544);
+    CHECK_EQ(mp6::mp6_normalize_step_rev(3200.6), 3201);
+    auto fractional = cfg;
+    fractional.axis[0].pot_lo = 3543.75;
+    CHECK(mp6::mp6_config_derive_calibration(fractional, cal, &err));
+    const float source_scale = std::fabs(3200.0f * 20.0f / (-12.0f * 360.0f));
+    const float source_offset = -source_scale * 3544.0f + 55.0f * 20.0f * 3200.0f / 360.0f;
+    CHECK_NEAR(cal[0].p_offset, source_offset, 0.001);
+    fractional.step_rev.value = 3200.6;
+    CHECK(mp6::mp6_config_derive_calibration(fractional, cal, &err));
+    const float rounded_step_scale = std::fabs(3201.0f * 20.0f / (-12.0f * 360.0f));
+    CHECK_NEAR(cal[0].p_scale, rounded_step_scale, 1e-6);
     CHECK(mp6::mp6_config_derive_calibration(cfg, cal, &err));
 
     // Independent float-math re-derivation from the SOURCE semantics

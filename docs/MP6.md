@@ -17,8 +17,8 @@ safety architecture, and provenance boundaries.
 | Binary protocol codec | Done, byte-exact offline tests (`mp6_protocol_codec`: 741 checks) |
 | Session engine (single TX owner) | Done, scripted in-memory tests (`mp6_session_lifecycle`: 1027 checks) |
 | Config import (`.pltc`) | Done: typed parse + calibration derivation |
-| Rotary geometry (crank solver) | Done: exact AtanKD crank solve, neutral zero pose, travel limits (`mp6_config_geometry`: 744 checks (original 684 plus 60 parser regressions)) |
-| Desktop app integration | Done: UI, control API, persistence, telemetry mirroring, glue tests (`mp6_desktop_glue`: 1871 checks across 25 deterministic scenarios and boundary checks) |
+| Rotary geometry (crank solver) | Done: exact AtanKD crank solve, neutral zero pose, travel limits (`mp6_config_geometry`: 755 checks (original 684 plus 71 parser/calibration/readiness regressions)) |
+| Desktop app integration | Done: UI, control API, persistence, telemetry mirroring, glue tests (`mp6_desktop_glue`: 2083 checks across 27 deterministic scenarios and boundary checks) |
 | Python automation (MCP / JSON-RPC) | Done: multi-entity support, shutdown verb, controller settings (26/26 tests passing; wrapper framing tests) |
 
 ## Safety Posture & Architectural Boundaries
@@ -139,7 +139,7 @@ file does **not** supply the design geometry (BotA/BotB/TopA/TopB) or pivot z
 coordinates — those are explicit entity fields and gate readiness.
 
 **MaxPPS is materialized by the desktop app at import**: the cmd-5 MaxPPS
-parameter equals `round(Max Motor RPM × Step/Rev / 60)` (snapshot:
+parameter equals `round(Max Motor RPM × normalized integer Step/Rev / 60)` (snapshot:
 230×3200/60 → 12267). The `.pltc` "Max Motor RPM" row is machine data and
 wins when present; when it is absent, an explicit MaxRPM field in the MP6
 settings supplies the value.
@@ -236,7 +236,7 @@ All 6 CTest test suites pass (100%):
 2. `documentation_transport_guards` — COM port safety gates under `STEWART_DOCUMENTATION_MODE=1`.
 3. `mp6_protocol_codec` (741 checks) — Byte-exact frame encoder/decoder and checksum verification.
 4. `mp6_session_lifecycle` (1027 checks) — Single-writer session state machine, tie rounding, dock AV refusal, and guards.
-5. `mp6_config_geometry` (744 checks: original 684 plus 60 parser regressions) — .pltc configuration import and rotary crank kinematics.
-6. `mp6_desktop_glue` (1871 checks) — Production App, internal persistence and real control-server dispatcher with MemoryLink and scripted telemetry. Repeated baseline assertions run across 25 scenarios: Stop during configuration/profile work and observed Parked/Docked; late ACKs; stale/failed geometry; malformed and rejected profile replacement; per-rig Start blending; disabled E-STOP and complete explicit recovery; pressure disable; lost-ACK recovery; source geometry and wire quantization. Shared production UI review actions are tested; no GUI click or visual layout test is claimed.
+5. `mp6_config_geometry` (755 checks: original 684 plus 71 parser/calibration/readiness regressions) — .pltc configuration import, source rounding and rotary crank kinematics.
+6. `mp6_desktop_glue` (2083 checks) — Production App, internal persistence and real control-server dispatcher with MemoryLink and scripted telemetry. Repeated baseline assertions run across 27 scenarios: Stop during configuration/profile work and observed Parked/Docked; late ACKs; stale/failed geometry; malformed and rejected profile replacement; per-rig Start blending; disabled E-STOP and complete explicit recovery; pressure disable; lost-ACK recovery; source geometry and wire quantization. Shared production UI review actions are tested; no GUI click or visual layout test is claimed.
 
 Python MCP / Automation test suite: 26/26 tests passing. These establish wrapper framing; C++ tests establish dispatcher behavior.

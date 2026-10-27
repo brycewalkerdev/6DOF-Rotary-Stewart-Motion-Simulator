@@ -199,9 +199,15 @@ static bool mp6BuildSessionInputs(const mp6::Mp6PlatformConfig& cfg,
     for (const auto& axis : cfg.axis)
         for (double value : {axis.pot_lo, axis.angle_docked_deg, axis.pot_scale, axis.gearbox})
             if (!std::isfinite(value) || std::abs(value) > 1000000) return invalid("Pot calibration");
+    mp6::Mp6PlatformConfig normalized_cfg = cfg;
+    if (normalized_cfg.step_rev.present)
+        normalized_cfg.step_rev.value = mp6::mp6_normalize_step_rev(cfg.step_rev.value);
+    for (int i = 0; i < mp6::kAxes; ++i)
+        if (normalized_cfg.axis[i].present[0])
+            normalized_cfg.axis[i].pot_lo = mp6::mp6_normalize_pot_lo(cfg.axis[i].pot_lo);
     mp6::Mp6AxisCalibration ac[mp6::kAxes];
     std::string err;
-    if (!mp6::mp6_config_derive_calibration(cfg, ac, &err)) {
+    if (!mp6::mp6_config_derive_calibration(normalized_cfg, ac, &err)) {
         if (why) *why = err;
         return false;
     }
@@ -213,7 +219,7 @@ static bool mp6BuildSessionInputs(const mp6::Mp6PlatformConfig& cfg,
     if (std::abs(cfg.accel_scale.value * cfg.accel_p1.value * 100.0) > 2147483647)
         return invalid("AccelP1");
     // Fields available from PlatformConfig.pltc
-    if (cfg.step_rev.present)          cc.stepRev = mp6WireRound(cfg.step_rev.value);
+    if (normalized_cfg.step_rev.present) cc.stepRev = static_cast<int>(normalized_cfg.step_rev.value);
     if (cfg.rotate_direction.present)  cc.rotationDirection = mp6WireRound(cfg.rotate_direction.value);
     if (cfg.max_pps != 0)              cc.maxPps = cfg.max_pps;   // derived (L18644: MaxRPM*StepRev/60)
 
@@ -265,7 +271,7 @@ static bool mp6BuildSessionInputs(const mp6::Mp6PlatformConfig& cfg,
     static_assert(mp6::kAxes == 6, "app assumes 6 MP6 axes");
     for (int i = 0; i < mp6::kAxes; i++) {
         const mp6::Mp6AxisPots& pots = cfg.axis[i];
-        if (pots.present[0]) cc.potLo[i] = mp6WireRound(pots.pot_lo);
+        if (pots.present[0]) cc.potLo[i] = static_cast<int>(normalized_cfg.axis[i].pot_lo);
         if (pots.present[5]) cc.gearboxTimes100[i] = mp6QuantizeFloatProduct(static_cast<float>(pots.gearbox), 100.0f);
         cc.angLoTimes10[i]    = mp6QuantizeFloatProduct(ac[i].ang_lo_deg, 10.0f);
         cc.pScaleTimes1000[i] = mp6QuantizeFloatProduct(ac[i].p_scale, 1000.0f);
@@ -364,8 +370,12 @@ static void mp6ApplyPlatformConfig(App& app, Entity& e) {
             have_rpm = true; rpm = (double)e.mp6.max_rpm_entry;
             snprintf(max_pps_src, sizeof(max_pps_src), "explicit MaxRPM entry");
         }
-        if (have_rpm && parsed.step_rev.present && parsed.step_rev.value > 0.0) {
-            double exact = rpm * parsed.step_rev.value / 60.0;
+        if (have_rpm && parsed.step_rev.present &&
+            std::isfinite(parsed.step_rev.value) && parsed.step_rev.value > 0.0 &&
+            mp6::mp6_net_round(parsed.step_rev.value) >= 1.0 &&
+            mp6::mp6_net_round(parsed.step_rev.value) <= INT_MAX) {
+            const int step_rev = mp6::mp6_normalize_step_rev(parsed.step_rev.value);
+            double exact = rpm * step_rev / 60.0;
             if (std::isfinite(exact) && exact >= 1.0 && exact <= 2147483647.0)
                 max_pps_materialized = mp6WireRound(exact);
         }

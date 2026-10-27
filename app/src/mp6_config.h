@@ -49,6 +49,8 @@ inline constexpr int kPltcColumns = 6; // DGV_Setup ColumnCount = 6 (Load_Coeffi
 double mp6_net_round(double v);
 // Same policy for a float operand (promoted exactly, still ties-to-even).
 float mp6_net_roundf(float v);
+int mp6_normalize_step_rev(double value);
+int mp6_normalize_pot_lo(double value);
 
 // ---------------------------------------------------------------------------
 // Parsed-file model

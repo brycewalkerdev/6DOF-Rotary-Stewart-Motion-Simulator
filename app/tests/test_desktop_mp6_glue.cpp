@@ -321,6 +321,16 @@ int runScenario(const std::string& mode) {
         replace_once("\t-12\tPot Scale", "\t16.928045\tPot Scale");
         replace_once("\t20\tGear Ratio", "\t19.045\tGear Ratio");
     }
+    if (mode == "potround") {
+        auto at = pltc.find("\t3543\tPot - Docked");
+        CHECK(at != std::string::npos);
+        if (at != std::string::npos) pltc.replace(at + 1, 4, "3543.75");
+    }
+    if (mode == "stepround") {
+        auto at = pltc.find("\t3200\t");
+        CHECK(at != std::string::npos);
+        if (at != std::string::npos) pltc.replace(at + 1, 4, "3200.6");
+    }
     if (mode == "savedzero") {
         auto row_end = pltc.find('\n');
         CHECK(row_end != std::string::npos);
@@ -344,7 +354,11 @@ int runScenario(const std::string& mode) {
     e0.mp6.design.point_zero_supplied = true;
     CHECK(g_app.mp6RefreshDesignGeometry(e0, &err));
     if (mode == "savedzero") {
+        e0.mp6.design.bot_b_mm = 230.0f;
+        e0.mp6.design.top_b_mm = 14.0f;
         e0.mp6.design.off_x_mm = 0.0f;
+        e0.mp6.design.base_radius_mm = 330.0f;
+        e0.mp6.design.platform_radius_mm = 50.0f;
         e0.mp6.design.x_offset_mm = 15.0f; // deliberately conflicting legacy alias
         e0.mp6.design.point_zero_x_mm = 5.0f;
         cJSON* document = cJSON_CreateObject();
@@ -356,6 +370,11 @@ int runScenario(const std::string& mode) {
         CHECK_EQ(e0.mp6.design.point_zero_x_mm, 5);
         CHECK(e0.mp6.design.supplied);
         CHECK_EQ(e0.mp6.design.pivot_z_provenance, 2);
+        const std::string status = DispatchControlCommand(
+            R"({"cmd":"mp6_status","args":{"entity":0}})");
+        CHECK(status.find("\"base_radius_mm\":230") != std::string::npos);
+        CHECK(status.find("\"platform_radius_mm\":14") != std::string::npos);
+        CHECK(status.find("\"x_offset_mm\":0") != std::string::npos);
     }
 
     bool recovered = false;
@@ -373,6 +392,15 @@ reconnect:
     g_app.mp6UpdateEntity(e0);
     CHECK(e0.mp6.viz.solver_ready);
     if (mode == "savedzero") CHECK_EQ(g_app.mp6_runtimes[e0.id]->x_offset_mm, 5);
+    if (mode == "savedzero") {
+        const std::string status = DispatchControlCommand(
+            R"({"cmd":"mp6_status","args":{"entity":0}})");
+        CHECK(status.find("\"base_radius_mm\":230") != std::string::npos);
+        CHECK(status.find("\"platform_radius_mm\":14") != std::string::npos);
+        CHECK(status.find("\"x_offset_mm\":0") != std::string::npos);
+        CHECK_EQ(e0.mp6.design.point_zero_x_mm, 5);
+        CHECK_EQ(g_app.mp6_runtimes[e0.id]->x_offset_mm, 5);
+    }
 
     g_app.frame_time += 0.016;
     g_app.update();
@@ -421,6 +449,7 @@ reconnect:
     int normal_dfilter = -999;
     int first_pressure_word = -1;
     int wire_decel = -999, wire_gearbox = -999, wire_ang_lo = -999, wire_p_scale = -999;
+    int wire_pot_lo = -999, wire_p_offset = -999, wire_step_rev = -999, wire_max_pps = -999;
     int first_running_target = INT_MIN;
     auto record_config = [&](const Bytes& w) {
         for (int pair = 0; pair < 3; ++pair) {
@@ -433,6 +462,10 @@ reconnect:
             if (key == 141) wire_gearbox = val;
             if (key == 111) wire_ang_lo = val;
             if (key == 121) wire_p_scale = val;
+            if (key == 21) wire_step_rev = val;
+            if (key == 34) wire_max_pps = val;
+            if (key == 101) wire_pot_lo = val;
+            if (key == 131) wire_p_offset = val;
         }
     };
     auto pump_ticks = [&](int count) {
@@ -740,6 +773,12 @@ reconnect:
     CHECK_EQ(e0.mp6.applied_pid_mode, 0); // Normal PID 0 applied!
     CHECK(g_app.motion_started);
     CHECK_EQ(normal_dfilter, 20); // source Single rounds 20.5000001 to represented20.5, ties even
+    if (mode == "potround") {
+        CHECK_EQ(wire_pot_lo, 3544);
+        CHECK_EQ(wire_p_offset, -4273);
+    }
+    if (mode == "stepround") CHECK_EQ(wire_step_rev, 3201);
+    if (mode == "stepround") CHECK_EQ(wire_max_pps, 12270);
     CHECK_EQ(normal_step_correction, expected_correction); // Framework Single F3 oracle, not snprintf
     CHECK(g_app.mp6_runtimes[e0.id]->start_blend_active);
 
@@ -1170,7 +1209,7 @@ void testBoundaries() {
 }
 
 int main() {
-    for (const char* mode : {"normal", "lostack", "pressureoff", "wirefloat", "savedzero", "priority", "badreplacement", "configurestop", "stale", "failedrefresh", "startstop", "parkedstop", "stagedstartstop", "dockedstop", "shutdownstop", "perstart", "jump", "disabled", "recovery", "quant0", "quant1", "quant2", "quant3", "quant4", "quant5"})
+    for (const char* mode : {"normal", "lostack", "pressureoff", "wirefloat", "potround", "stepround", "savedzero", "priority", "badreplacement", "configurestop", "stale", "failedrefresh", "startstop", "parkedstop", "stagedstartstop", "dockedstop", "shutdownstop", "perstart", "jump", "disabled", "recovery", "quant0", "quant1", "quant2", "quant3", "quant4", "quant5"})
         runScenario(mode);
     testBoundaries();
     printf("Total desktop checks: %d, failures: %d\n", g_checks, g_failures);

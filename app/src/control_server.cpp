@@ -1271,9 +1271,9 @@ std::string handle(const std::string& line) {
             cJSON_AddBoolToObject(r, "pivot_z_provenance_reviewed",
                                   e->mp6.design.pivot_z_provenance == 2);
             cJSON_AddBoolToObject(d, "supplied", m.design.supplied);
-            cJSON_AddNumberToObject(d, "base_radius_mm", m.design.base_radius_mm);
-            cJSON_AddNumberToObject(d, "platform_radius_mm", m.design.platform_radius_mm);
-            cJSON_AddNumberToObject(d, "x_offset_mm", m.design.x_offset_mm);
+            cJSON_AddNumberToObject(d, "base_radius_mm", m.design.bot_b_mm);
+            cJSON_AddNumberToObject(d, "platform_radius_mm", m.design.top_b_mm);
+            cJSON_AddNumberToObject(d, "x_offset_mm", m.design.off_x_mm);
             cJSON_AddItemToObject(r, "design", d);
             cJSON_AddNumberToObject(r, "fault_code", m.fault_code);
             cJSON_AddBoolToObject(r, "fault_latched", m.fault_latched);

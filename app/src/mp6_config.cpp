@@ -36,6 +36,11 @@ float mp6_net_roundf(float v) {
     return static_cast<float>(mp6_net_round(static_cast<double>(v)));
 }
 
+int mp6_normalize_step_rev(double value) { return static_cast<int>(mp6_net_round(value)); }
+int mp6_normalize_pot_lo(double value) {
+    return static_cast<int>(mp6_net_round(static_cast<double>(static_cast<float>(value))));
+}
+
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
@@ -482,7 +487,7 @@ bool mp6_config_derive_calibration(const Mp6PlatformConfig& cfg,
         *err = "Step/Rev missing or not positive";
         return false;
     }
-    const int step_rev = static_cast<int>(cfg.step_rev.value);
+    const int step_rev = mp6_normalize_step_rev(cfg.step_rev.value);
 
     for (int i = 0; i < kAxes; ++i) {
         const Mp6AxisPots& a = cfg.axis[i];
@@ -494,7 +499,7 @@ bool mp6_config_derive_calibration(const Mp6PlatformConfig& cfg,
             return false;
         }
         // float semantics of the recovered statics
-        const int pot_lo = static_cast<int>(a.pot_lo);
+        const int pot_lo = mp6_normalize_pot_lo(a.pot_lo);
         const float angle_docked =
             static_cast<float>(a.angle_docked_deg);
         const float pot_scale_raw = static_cast<float>(a.pot_scale);
@@ -696,17 +701,20 @@ bool mp6_ready_for_onboard_config(const Mp6PlatformConfig& cfg,
 
     // MaxPPS is a cmd-5 parameter and must be materialized by the caller
     // (review-2 N3): "derivable but never computed" must not pass readiness.
-    // The caller computes cfg.max_pps = round(MaxRPM * StepRev / 60) —
+    // The caller computes cfg.max_pps = round(MaxRPM * normalized StepRev / 60) —
     // snapshot: 230*3200/60 = 12266.7 -> 12267 — or sources it explicitly.
     if (cfg.max_pps <= 0) {
         d->push_back({ConfigDiagnostic::Severity::kError, "MaxPPS",
                       "not materialized: the caller must set cfg.max_pps "
                       "explicitly (snapshot: 230*3200/60 -> 12267)"});
     } else if (cfg.step_rev.present && cfg.max_motor_rpm.present &&
-               cfg.step_rev.value > 0.0 && cfg.max_motor_rpm.value > 0.0) {
-        // Plausibility against the source formula. Range-check the exact
-        // product BEFORE rounding/integer conversion (review-2 N3).
-        const double exact = cfg.max_motor_rpm.value * cfg.step_rev.value / 60.0;
+               std::isfinite(cfg.step_rev.value) && cfg.step_rev.value > 0.0 &&
+               mp6_net_round(cfg.step_rev.value) >= 1.0 &&
+               mp6_net_round(cfg.step_rev.value) <= INT_MAX &&
+               cfg.max_motor_rpm.value > 0.0) {
+        // Normalize Step/Rev before matching the recovered MaxPPS formula.
+        const int step_rev = mp6_normalize_step_rev(cfg.step_rev.value);
+        const double exact = cfg.max_motor_rpm.value * step_rev / 60.0;
         if (std::isfinite(exact) && exact >= 1.0 &&
             exact <= static_cast<double>(INT32_MAX)) {
             const double expected = mp6_net_round(exact);
