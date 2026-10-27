@@ -8,7 +8,8 @@ COBS HIL backend — settings stay compatible, transports and wires do not mix.
 Status: **Implemented with offline production-path regression coverage; hardware is not commissioned.** The onboard control mode
 (command 2 stage-target streaming at 60 Hz) is the primary supported control mode;
 host PID was reviewed and rejected. This page describes the implementation,
-safety architecture, and provenance boundaries.
+safety architecture, and provenance boundaries. For the first connection to a
+real controller, follow the [first live test checklist](MP6_FIRST_LIVE_TEST.md).
 
 ## Scope at a glance
 
@@ -18,8 +19,8 @@ safety architecture, and provenance boundaries.
 | Session engine (single TX owner) | Done, scripted in-memory tests (`mp6_session_lifecycle`: 1027 checks) |
 | Config import (`.pltc`) | Done: typed parse + calibration derivation |
 | Rotary geometry (crank solver) | Done: exact AtanKD crank solve, neutral zero pose, travel limits (`mp6_config_geometry`: 755 checks (original 684 plus 71 parser/calibration/readiness regressions)) |
-| Desktop app integration | Done: UI, control API, persistence, telemetry mirroring, glue tests (`mp6_desktop_glue`: 2083 checks across 27 deterministic scenarios and boundary checks) |
-| Python automation (MCP / JSON-RPC) | Done: multi-entity support, shutdown verb, controller settings (26/26 tests passing; wrapper framing tests) |
+| Desktop app integration | Done: UI, control API, persistence, telemetry mirroring, glue tests (`mp6_desktop_glue`: 11601 checks across 28 scenarios and boundary checks) |
+| Python automation (MCP / JSON-RPC) | Done: multi-entity support, shutdown verb, controller settings and axis-test wrapper (26/26 tests passing; wrapper framing tests) |
 
 ## Safety Posture & Architectural Boundaries
 
@@ -96,15 +97,25 @@ safety architecture, and provenance boundaries.
   and missed slots, expected platform number/pairing, the `.pltc` config
   import, explicit design fields, controller parameters form, and an observation-driven
   readiness checklist.
+- The **Axis test (commissioning)** controls move crank targets directly from
+  neutral only while observed Running after the start blend and with neither
+  desktop E-STOP nor onboard fault latch. Default slew is 2 deg/s and each
+  axis has a default ±5 deg cap, adjustable up to ±15 deg. Travel limits remain enforced;
+  disabling ramps to neutral before the existing 0.6 s pose blend resumes.
 - Platform tab (design form): design-table numbers, per-axis pivot z entry
   with the two-step review gate, MotConv point zeros confirmation, and Apply —
   the crank solver rebuilds on the main thread and its readiness note names
   exactly what is still missing.
-- 3D view: base/platform attachments drawn **only** from the explicitly
-  entered design geometry; the viewport overlay explicitly notes: "target pose
-  only — measured feedback in I/O table". The two are never conflated, and the
-  model is never labelled as feedback. When a fresh crank solve ran, the rotary
-  chain is drawn from the solver's own recorded joints.
+  - 3D view: base/platform attachments drawn **only** from the explicitly
+    entered design geometry; the viewport overlay explicitly notes: "target pose
+    only — measured feedback in I/O table". The two are never conflated, and the
+    model is never labelled as feedback. When a fresh crank solve ran, the rotary
+    chain is drawn from the solver's own recorded joints. During Axis test
+    (commissioning), the platform stays at neutral while solid crank/rod chains
+    show the commanded crank angles and faint crank ghosts show calibrated
+    feedback. Rods whose neutral-top distance differs from rod length by more
+    than 1 mm are marked unsolved; the pose-input chain is hidden until the
+    return reaches neutral and pose blending resumes.
 - Time-series "Servo Angles / Feedback": MP6 entities plot calibrated feedback
   steps; uncalibrated axes (`SHRT_MIN`) display as "no calibration".
 
@@ -119,6 +130,16 @@ Verbs for MP6 (real connects and lifecycle commands are refused in documentation
 - `mp6_command` — stage one intent:
   `identify|configure|initialize|start|stop|park|shutdown|disconnect`.
   Strict multi-entity targeting: a supplied ID must be a finite integral JSON number in `[0, INT_MAX]`, identify an existing entity, and select the MP6 backend. Only an omitted ID selects a default.
+- `mp6_axis_test` — guarded commissioning target control. `enable` and
+  `neutral_all` are strict booleans; `axis` is an integer 1..6 and pairs with
+  finite `offset_deg`; optional `cap_deg` sets that axis cap when `axis` is
+  supplied, or all caps when omitted; it is 0.1..15. `slew_deg_s` is
+  0.1..30. Enable is refused outside Running after the start blend, in
+  documentation mode, or under either latch. `mp6_status` includes the enable
+  entering/enabled/returning flags, cap/slew, per-axis setpoints, ramped
+  degree/step offsets and commanded target steps; calibrated feedback comes
+  from the existing telemetry mirror. Entry slews the last transmitted target
+  to neutral before accepting nonzero setpoints.
 - `mp6_config_import` — parse/derive/stage raw `.pltc` text.
 - `mp6_recover_known_state` with `physical_state_confirmed: true` — disconnect and clear the desktop latch after independent physical controls establish a known state. It does not connect or identify.
 - `mp6_controller_settings` — set explicit machine-level controller parameters
@@ -237,6 +258,6 @@ All 6 CTest test suites pass (100%):
 3. `mp6_protocol_codec` (741 checks) — Byte-exact frame encoder/decoder and checksum verification.
 4. `mp6_session_lifecycle` (1027 checks) — Single-writer session state machine, tie rounding, dock AV refusal, and guards.
 5. `mp6_config_geometry` (755 checks: original 684 plus 71 parser/calibration/readiness regressions) — .pltc configuration import, source rounding and rotary crank kinematics.
-6. `mp6_desktop_glue` (2083 checks) — Production App, internal persistence and real control-server dispatcher with MemoryLink and scripted telemetry. Repeated baseline assertions run across 27 scenarios: Stop during configuration/profile work and observed Parked/Docked; late ACKs; stale/failed geometry; malformed and rejected profile replacement; per-rig Start blending; disabled E-STOP and complete explicit recovery; pressure disable; lost-ACK recovery; source geometry and wire quantization. Shared production UI review actions are tested; no GUI click or visual layout test is claimed.
+6. `mp6_desktop_glue` (11601 checks) — Production App, internal persistence and real control-server dispatcher with MemoryLink and scripted telemetry. Across 28 deterministic scenarios and boundary checks, including axis-test readiness/latch guards, low-slew entry progress and neutral gating, re-enable during return, one-axis calibrated wire targets, slew/cap/travel clamps, single-axis refusal, pose-input immunity, neutral return/blending, safety clears, strict API types/IDs and status reporting. Existing coverage includes Stop during configuration/profile work, late ACKs, stale/failed geometry, per-rig Start blending, recovery, shutdown and wire quantization. Shared production UI review actions are tested; no GUI click or visual layout test is claimed.
 
-Python MCP / Automation test suite: 26/26 tests passing. These establish wrapper framing; C++ tests establish dispatcher behavior.
+Python MCP / Automation test suite: 26/26 tests passing. These establish the axis-test wrapper framing; C++ tests establish dispatcher behavior.

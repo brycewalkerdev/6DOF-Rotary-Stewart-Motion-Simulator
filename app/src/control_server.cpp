@@ -402,7 +402,7 @@ std::string handle(const std::string& line) {
             "hil_raw_mode", "hil_tx_rate", "estop", "entity_enable", "record", "recording_delete",
             "recording_rename", "recordings_save", "geometry_get", "geometry_set", "geometry_push",
             "mca_push", "mca_save", "console_rate", "quit",
-            "mp6_status", "mp6_connect", "mp6_disconnect", "mp6_command", "mp6_config_import", "mp6_controller_settings", "mp6_recover_known_state"
+            "mp6_status", "mp6_connect", "mp6_disconnect", "mp6_command", "mp6_axis_test", "mp6_config_import", "mp6_controller_settings", "mp6_recover_known_state"
         };
         cJSON* r = cJSON_CreateObject();
         cJSON_AddNumberToObject(r, "api", 2);
@@ -1281,6 +1281,16 @@ std::string handle(const std::string& line) {
             cJSON_AddBoolToObject(r, "feedback_valid", m.feedback_valid);
             cJSON_AddBoolToObject(r, "target_pose_valid", m.target_pose_valid);
             cJSON_AddBoolToObject(r, "step_target_valid", m.step_target_valid);
+            cJSON_AddBoolToObject(r, "axis_test_enabled", m.axis_test_enabled);
+            cJSON_AddBoolToObject(r, "axis_test_entering", m.axis_test_entering);
+            cJSON_AddBoolToObject(r, "axis_test_returning", m.axis_test_returning);
+            cJSON_AddBoolToObject(r, "axis_test_single_only", m.axis_test_single_only);
+            { double v[6]; for (int i = 0; i < 6; ++i) v[i] = m.axis_test_cap_deg[i]; cJSON_AddItemToObject(r, "axis_test_cap_deg", cJSON_CreateDoubleArray(v, 6)); }
+            cJSON_AddNumberToObject(r, "axis_test_slew_deg_s", m.axis_test_slew_deg_s);
+            { double v[6]; for (int i = 0; i < 6; ++i) v[i] = m.axis_test_setpoint_deg[i]; cJSON_AddItemToObject(r, "axis_test_setpoint_deg", cJSON_CreateDoubleArray(v, 6)); }
+            { double v[6]; for (int i = 0; i < 6; ++i) v[i] = m.axis_test_offset_deg[i]; cJSON_AddItemToObject(r, "axis_test_offset_deg", cJSON_CreateDoubleArray(v, 6)); }
+            { double v[6]; for (int i = 0; i < 6; ++i) v[i] = m.axis_test_offset_steps[i]; cJSON_AddItemToObject(r, "axis_test_offset_steps", cJSON_CreateDoubleArray(v, 6)); }
+            { double v[6]; for (int i = 0; i < 6; ++i) v[i] = m.axis_test_target_steps[i]; cJSON_AddItemToObject(r, "axis_test_target_steps", cJSON_CreateDoubleArray(v, 6)); }
             cJSON_AddNumberToObject(r, "tel_type48_per_sec", m.tel_hz_est);
             cJSON_AddNumberToObject(r, "tx_hz", e->rate_tx_hz);
             cJSON_AddNumberToObject(r, "achieved_target_hz", m.achieved_target_hz);
@@ -1377,6 +1387,39 @@ std::string handle(const std::string& line) {
                     cJSON_AddStringToObject(r, "staged", "true (dispatched on the next update)");
                     RESULT(r);
                 }
+            }
+        }
+    }
+    else if (!strcmp(cmd, "mp6_axis_test")) {
+        std::string why;
+        Entity* e = resolve_mp6_entity(a, &why);
+        cJSON* en = a ? cJSON_GetObjectItem(a, "enable") : nullptr;
+        cJSON* ax = a ? cJSON_GetObjectItem(a, "axis") : nullptr;
+        cJSON* off = a ? cJSON_GetObjectItem(a, "offset_deg") : nullptr;
+        cJSON* cap = a ? cJSON_GetObjectItem(a, "cap_deg") : nullptr;
+        cJSON* slew = a ? cJSON_GetObjectItem(a, "slew_deg_s") : nullptr;
+        cJSON* na = a ? cJSON_GetObjectItem(a, "neutral_all") : nullptr;
+        if (!e) ERR(why.c_str());
+        else if ((en && !cJSON_IsBool(en)) || (na && !cJSON_IsBool(na))) ERR("enable and neutral_all must be JSON booleans");
+        else if (ax && (!cJSON_IsNumber(ax) || !std::isfinite(ax->valuedouble) || std::floor(ax->valuedouble) != ax->valuedouble || ax->valuedouble < 1 || ax->valuedouble > 6)) ERR("axis must be an integer from 1 to 6");
+        else if (off && (!cJSON_IsNumber(off) || !std::isfinite(off->valuedouble))) ERR("offset_deg must be a finite JSON number");
+        else if (cap && (!cJSON_IsNumber(cap) || !std::isfinite(cap->valuedouble) || cap->valuedouble < 0.1 || cap->valuedouble > 15.0)) ERR("cap_deg must be between 0.1 and 15");
+        else if (slew && (!cJSON_IsNumber(slew) || !std::isfinite(slew->valuedouble) || slew->valuedouble < 0.1 || slew->valuedouble > 30.0)) ERR("slew_deg_s must be between 0.1 and 30");
+        else if (ax && !off) ERR("offset_deg is required with axis");
+        else if (off && !ax) ERR("axis is required with offset_deg");
+        else {
+            const bool enable = en ? cJSON_IsTrue(en) : e->mp6.axis_test_enabled;
+            if (ax && !en && !e->mp6.axis_test_enabled) ERR("enable axis test before changing a setpoint");
+            else if (!g_app.mp6AxisTest(*e, enable, ax ? ax->valueint - 1 : -1,
+                    off ? off->valuedouble : 0.0,
+                    cap ? cap->valuedouble : -1.0,
+                    slew ? slew->valuedouble : e->mp6.axis_test_slew_deg_s,
+                    na && cJSON_IsTrue(na), &why)) ERR(why.c_str());
+            else {
+                cJSON* r = cJSON_CreateObject();
+                cJSON_AddNumberToObject(r, "entity", e->id);
+                cJSON_AddBoolToObject(r, "enabled", e->mp6.axis_test_enabled);
+                RESULT(r);
             }
         }
     }

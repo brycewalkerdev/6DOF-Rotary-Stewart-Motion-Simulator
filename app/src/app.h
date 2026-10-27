@@ -294,10 +294,15 @@ struct Mp6DesignState {
 struct Mp6VizState {
     bool   solver_ready = false;
     bool   rod_lines_valid = false;
+    bool   axis_test_active = false;
+    bool   axis_test_geometry_valid = false;
     bool   axis_ok[6] = {};
+    bool   measured_crank_valid[6] = {};
     float  base_pivot[6][3] = {};
     float  crank_joint[6][3] = {};
+    float  measured_crank_joint[6][3] = {};
     float  rod_top[6][3] = {};
+    float  axis_test_plate[6][3] = {};
     float  calc_residual_mm[6] = {};
 };
 
@@ -384,6 +389,17 @@ struct Mp6BackendState {
     bool               cadence_normalised = false;
     bool               shutdown_pending = false;
     int                applied_pid_mode = -1;
+
+    bool               axis_test_enabled = false;
+    bool               axis_test_entering = false;
+    bool               axis_test_returning = false;
+    bool               axis_test_single_only = true;
+    float              axis_test_cap_deg[6] = {5, 5, 5, 5, 5, 5};
+    float              axis_test_slew_deg_s = 2.0f;
+    float              axis_test_setpoint_deg[6] = {};
+    float              axis_test_offset_deg[6] = {};
+    int32_t            axis_test_offset_steps[6] = {};
+    int32_t            axis_test_target_steps[6] = {};
 
     bool               ramp_active = false;
     int32_t            ramp_start[6] = {};
@@ -707,6 +723,10 @@ struct App {
     bool    mp6AcceptDesign(Entity& e, const Mp6DesignState& draft, std::string* error);
     bool    mp6RecoverKnownState(Entity& e, std::string* error);
     bool    mp6SetControllerSettings(Entity& e, const Mp6MachineSettings& settings, std::string* error);
+    bool    mp6AxisTestAllowed(const Entity& e, std::string* reason = nullptr) const;
+    bool    mp6AxisTest(Entity& e, bool enable, int axis, double offset_deg,
+                        double cap_deg, double slew_deg_s, bool neutral_all,
+                        std::string* error);
     bool    mp6ValidateMachineSettings(const Mp6MachineSettings& settings, std::string* error);
     bool    mp6IsMotorPowerRequested(const Entity& e) const;
     bool    mp6InvalidateAuthority(Entity& e, bool invalidate_config, bool invalidate_geometry);

@@ -217,6 +217,7 @@ if(BUILD_TESTING AND WIN32)
     )
     target_compile_definitions(stewart-mp6-desktop-tests PRIVATE
         SIL_BUILD=1
+        STEWART_DOCUMENTATION_DYNAMIC=1
         _USE_MATH_DEFINES
     )
     target_link_libraries(stewart-mp6-desktop-tests PRIVATE

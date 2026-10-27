@@ -240,6 +240,7 @@ void setupTestGeometry(Entity& e) {
 
 int runScenario(const std::string& mode) {
     std::printf("Scenario %s\n", mode.c_str());
+    _putenv(mode == "axistest" ? "STEWART_DOCUMENTATION_MODE=0" : "STEWART_DOCUMENTATION_MODE=1");
     g_app.mp6_runtimes.clear();
     g_app.next_entity_id = 0;
     g_app.start_ramp_active = false;
@@ -247,7 +248,7 @@ int runScenario(const std::string& mode) {
     std::printf("=== MP6 Desktop Glue Integration Tests ===\n");
 
     // Force documentation mode
-    _putenv("STEWART_DOCUMENTATION_MODE=1");
+    _putenv(mode == "axistest" ? "STEWART_DOCUMENTATION_MODE=0" : "STEWART_DOCUMENTATION_MODE=1");
 
     // Clear and re-initialize application
     g_app.entities.clear();
@@ -468,7 +469,7 @@ reconnect:
             if (key == 131) wire_p_offset = val;
         }
     };
-    auto pump_ticks = [&](int count) {
+    auto pump_ticks = [&](int count, double frame_dt = 0.016) {
         for (int i = 0; i < count; ++i) {
             auto writes = link->takeWrites();
             for (const auto& w : writes) {
@@ -496,7 +497,7 @@ reconnect:
             }
             feedSupplyAxes(link, ax);
             link->inject(makeType48(1, 0x03, ax, pairing)); // status 3: configReceived + avOk
-            g_app.frame_time += 0.016;
+            g_app.frame_time += frame_dt;
             g_app.mp6UpdateEntity(e0);
         }
     };
@@ -543,6 +544,11 @@ reconnect:
     }
     CHECK(e0.mp6.config_send_ok);
     CHECK(e0.mp6.av_ok);
+    if (mode == "axistest") {
+        std::string why;
+        CHECK(!g_app.mp6AxisTest(e0, true, -1, 0, 5, 2, false, &why));
+        CHECK(why.find("Running") != std::string::npos); // Configured is refused
+    }
     if (mode == "wirefloat") {
         CHECK_EQ(wire_decel, 124); // 1.245f * 100f -> 124.5, half-even
         CHECK_EQ(wire_gearbox, 1904); // 19.045f * 100f -> 1904.5, half-even
@@ -634,6 +640,11 @@ reconnect:
     }
     CHECK(reached_parked);
     CHECK_EQ(static_cast<int>(e0.mp6.lifecycle), static_cast<int>(Mp6Lifecycle::Parked));
+    if (mode == "axistest") {
+        std::string why;
+        CHECK(!g_app.mp6AxisTest(e0, true, -1, 0, 5, 2, false, &why));
+        CHECK(why.find("Running") != std::string::npos); // Parked is refused
+    }
     // Verify applied PID profile is Lifecycle (2)
     CHECK_EQ(e0.mp6.applied_pid_mode, 2);
     if (mode == "savedzero") {
@@ -782,6 +793,419 @@ reconnect:
     CHECK_EQ(normal_step_correction, expected_correction); // Framework Single F3 oracle, not snprintf
     CHECK(g_app.mp6_runtimes[e0.id]->start_blend_active);
 
+    if (mode == "axistest") {
+        std::string why;
+        CHECK(!g_app.mp6AxisTest(e0, true, -1, 0, 5, 2, false, &why)); // blend is not complete
+        for (int i = 0; i < 50; ++i) pump_ticks(1);
+        CHECK(g_app.mp6AxisTestAllowed(e0, &why));
+        _putenv("STEWART_DOCUMENTATION_MODE=1");
+        CHECK(!g_app.mp6AxisTest(e0, true, -1, 0, 5, 2, false, &why));
+        CHECK(why.find("documentation") != std::string::npos);
+        _putenv("STEWART_DOCUMENTATION_MODE=0");
+        e0.mp6.estop_latched = true;
+        CHECK(!g_app.mp6AxisTest(e0, true, -1, 0, 5, 2, false, &why));
+        e0.mp6.estop_latched = false;
+        e0.mp6.fault_latched = true;
+        CHECK(!g_app.mp6AxisTest(e0, true, -1, 0, 5, 2, false, &why));
+        e0.mp6.fault_latched = false;
+
+        auto response = DispatchControlCommand(R"({"cmd":"mp6_status","args":{"entity":0}})");
+        const float validation_cap = e0.mp6.axis_test_cap_deg[0];
+        const float validation_slew = e0.mp6.axis_test_slew_deg_s;
+        response = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":0,"cap_deg":-100}})");
+        CHECK(response.find("\"ok\":false") != std::string::npos);
+        CHECK_EQ(e0.mp6.axis_test_cap_deg[0], validation_cap);
+        response = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":0,"cap_deg":16}})");
+        CHECK(response.find("\"ok\":false") != std::string::npos);
+        CHECK_EQ(e0.mp6.axis_test_cap_deg[0], validation_cap);
+        response = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":0,"cap_deg":0.05}})");
+        CHECK(response.find("\"ok\":false") != std::string::npos);
+        CHECK_EQ(e0.mp6.axis_test_cap_deg[0], validation_cap);
+        response = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":0,"slew_deg_s":31}})");
+        CHECK(response.find("\"ok\":false") != std::string::npos);
+        CHECK_EQ(e0.mp6.axis_test_slew_deg_s, validation_slew);
+        response = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":0,"slew_deg_s":0.05}})");
+        CHECK(response.find("\"ok\":false") != std::string::npos);
+        CHECK_EQ(e0.mp6.axis_test_slew_deg_s, validation_slew);
+        response = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":0,"offset_deg":2}})");
+        CHECK(response.find("\"ok\":false") != std::string::npos);
+        CHECK_EQ(e0.mp6.axis_test_setpoint_deg[0], 0.0f);
+        response = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":0,"axis":1.5,"offset_deg":1}})");
+        CHECK(response.find("axis must be an integer") != std::string::npos);
+        response = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":1,"enable":true}})");
+        CHECK(response.find("not an MP6") != std::string::npos);
+        auto& rt = *g_app.mp6_runtimes[e0.id];
+        const int pose_steps[6] = {219, -219, -477, -55, 55, 477};
+        for (int i = 0; i < 6; ++i) e0.mp6.step_target[i] = pose_steps[i];
+        e0.mp6.step_target_valid = true;
+        for (int i = 0; i < 80; ++i) {
+            feedSupplyAxes(link, ax);
+            link->inject(makeType48(1, 0x03, ax, pairing));
+            g_app.frame_time += 0.016;
+            g_app.mp6UpdateEntity(e0);
+        }
+        auto read_cmd2 = [](const Bytes& w, int axis) {
+            const size_t b = 3 + static_cast<size_t>(axis) * 2;
+            return (static_cast<int>(w[b]) | (static_cast<int>(w[b + 1]) << 8)) - 32767;
+        };
+        int entry_prior[6]{};
+        bool got_pose_target = false;
+        for (const auto& w : link->takeWrites()) if (w.size() >= 18 && w[0] == 0xFE && w[1] == 0xFC && w[2] == 2) {
+            for (int i = 0; i < 6; ++i) entry_prior[i] = read_cmd2(w, i);
+            got_pose_target = true;
+        }
+        CHECK(got_pose_target);
+        CHECK(entry_prior[0] != rt.neutral_steps[0]);
+        CHECK(!g_app.mp6AxisTest(e0, true, 0, 1, -1, 2, false, &why));
+        CHECK(!e0.mp6.axis_test_enabled);
+        response = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":0,"enable":true,"slew_deg_s":0.1}})");
+        CHECK(response.find("\"ok\":true") != std::string::npos);
+        response = DispatchControlCommand(R"({"cmd":"mp6_status","args":{"entity":0}})");
+        CHECK(response.find("axis_test_enabled") != std::string::npos);
+        CHECK(response.find("axis_test_entering\":true") != std::string::npos);
+        CHECK(response.find("axis_test_offset_steps") != std::string::npos);
+        CHECK(g_app.mp6AxisTest(e0, true, -1, 0, 5, 0.1, false, &why));
+        CHECK(e0.mp6.axis_test_entering);
+        const float saved_setpoint = e0.mp6.axis_test_setpoint_deg[0];
+        CHECK(!g_app.mp6AxisTest(e0, true, 0, 1, -1, 2, false, &why));
+        CHECK_EQ(e0.mp6.axis_test_setpoint_deg[0], saved_setpoint);
+        bool entry_done = false;
+        int ticks_since_wire = 0;
+        for (int i = 0; i < 3000 && !entry_done; ++i) {
+            pump_ticks(1, 0.020);
+            ++ticks_since_wire;
+            entry_done = !e0.mp6.axis_test_entering;
+            for (const auto& w : link->takeWrites()) if (w.size() >= 18 && w[0] == 0xFE && w[1] == 0xFC && w[2] == 2) {
+                for (int j = 0; j < 6; ++j) {
+                    const int target = read_cmd2(w, j);
+                    const double allowed = (std::max)(1.0, std::ceil(e0.mp6.axis_test_slew_deg_s * ticks_since_wire * 0.0201 * 3.14159265358979323846 / 180.0 * std::abs(rt.angle_to_step[j])));
+                    CHECK(std::abs(target - entry_prior[j]) <= allowed);
+                    entry_prior[j] = target;
+                }
+                ticks_since_wire = 0;
+            }
+            if (i == 499) {
+                g_app.update();
+                const double expected = 0.1 * 10.0 * 3.14159265358979323846 / 180.0 * std::abs(rt.angle_to_step[0]);
+                CHECK(std::abs(entry_prior[0] - pose_steps[0]) >= expected * 0.85);
+                CHECK(std::abs(entry_prior[0] - pose_steps[0]) <= expected * 1.15);
+                const double init[6] = {3.141592653589793, 0, 3.141592653589793, 0, 3.141592653589793, 0};
+                const double xoff[6] = {5.235987755982989, 4.1887902047863905, 1.0471975511965976, 0, 3.141592653589793, 2.0943951023931953};
+                CHECK(e0.mp6.viz.axis_test_active);
+                CHECK(rt.design.crank_length_mm > 0.0);
+                CHECK(std::abs(rt.design.crank_length_mm - 230.0) < 1e-9);
+                CHECK(std::abs(rt.design.rod_length_mm - 645.0) < 1e-9);
+                for (int j = 0; j < 6; ++j) {
+                    const double commanded = rt.neutral_crank_rad[j]
+                        + (rt.axis_test_last_sent_steps[j] - rt.neutral_steps[j]) / rt.angle_to_step[j];
+                    const double a = commanded + init[j];
+                    const double expected_joint[3] = {
+                        rt.geometry.base_pivot_mm[j][0] + 230.0 * std::cos(a) * std::cos(xoff[j]),
+                        rt.geometry.base_pivot_mm[j][1] + 230.0 * std::cos(a) * std::sin(xoff[j]),
+                        rt.geometry.base_pivot_mm[j][2] + 230.0 * std::sin(a)};
+                    for (int c = 0; c < 3; ++c)
+                        CHECK(std::abs(e0.mp6.viz.crank_joint[j][c] - expected_joint[c]) < 0.002);
+                }
+            }
+        }
+        CHECK(entry_done);
+        pump_ticks(3);
+        for (const auto& w : link->takeWrites()) if (w.size() >= 18 && w[0] == 0xFE && w[1] == 0xFC && w[2] == 2)
+            for (int j = 0; j < 6; ++j) CHECK_EQ(read_cmd2(w, j), rt.neutral_steps[j]);
+        CHECK(!e0.mp6.axis_test_entering);
+        CHECK(g_app.mp6AxisTest(e0, true, -1, 0, -1, 2, false, &why));
+        memset(e0.state.input_pct, 0, sizeof(e0.state.input_pct));
+
+        auto set_axis = [&](int axis, double degrees, double cap_deg) {
+            return DispatchControlCommand(std::string(R"({"cmd":"mp6_axis_test","args":{"entity":0,"enable":true,"axis":)") +
+                std::to_string(axis) + R"(,"offset_deg":)" + std::to_string(degrees) +
+                R"(,"cap_deg":)" + std::to_string(cap_deg) + R"(,"slew_deg_s":2}})");
+        };
+        response = set_axis(3, -1.5, 1.0);
+        CHECK(response.find("exceeds the configured cap") != std::string::npos);
+        response = set_axis(3, -1.0, 1.0);
+        CHECK(response.find("\"ok\":true") != std::string::npos);
+        float prior = 0.0f;
+        bool reached_cap = false;
+        for (int i = 0; i < 100; ++i) {
+            pump_ticks(1);
+            const float current = e0.mp6.axis_test_offset_deg[2];
+            CHECK(current - 1e-4f <= prior);
+            CHECK(prior - current <= 2.0f * 0.0161f + 0.001f);
+            CHECK(current >= -1.0001f);
+            prior = current;
+            if (current <= -0.999f) reached_cap = true;
+            e0.state.input_pct[0] = (i & 1) ? 80.0f : -80.0f;
+        }
+        CHECK(reached_cap);
+        CHECK(!g_app.mp6AxisTest(e0, true, 0, 1.0, 5, 2, false, &why)); // other axis remains selected
+        response = set_axis(3, 0.0, 1.0);
+        CHECK(response.find("\"ok\":true") != std::string::npos);
+        pump_ticks(50);
+        CHECK(std::abs(e0.mp6.axis_test_offset_deg[2]) < 0.001f);
+
+        response = set_axis(1, 5.0, 5.0);
+        CHECK(response.find("\"ok\":true") != std::string::npos);
+        bool only_axis_moved = false;
+        bool first_wire_after_setpoint = true;
+        prior = 0.0f;
+        for (int i = 0; i < 160; ++i) {
+            feedSupplyAxes(link, ax);
+            link->inject(makeType48(1, 0x03, ax, pairing));
+            g_app.frame_time += 0.02;
+            const float current = e0.mp6.axis_test_offset_deg[0];
+            CHECK(current + 1e-4f >= prior);
+            CHECK(current <= 5.0001f);
+            prior = current;
+            e0.state.input_pct[0] = (i & 1) ? 60.0f : -60.0f;
+            g_app.update(); // pose changes are processed but must not reach the active axis target
+            const float commanded_offset = e0.mp6.axis_test_offset_deg[0];
+            CHECK(commanded_offset - prior <= 2.0f * 0.0201f + 0.001f);
+            prior = e0.mp6.axis_test_offset_deg[0];
+            for (const auto& w : link->takeWrites()) if (w.size() >= 18 && w[2] == 2) {
+                for (int j = 0; j < 6; ++j) {
+                    const size_t b = 3 + static_cast<size_t>(j) * 2;
+                    int target = (static_cast<int>(w[b]) | (static_cast<int>(w[b + 1]) << 8)) - 32767;
+                    if (j == 0) {
+                        if (target != rt.neutral_steps[j]) only_axis_moved = true;
+                        const float expected_offset = first_wire_after_setpoint ? current : commanded_offset;
+                        CHECK_EQ(target, rt.neutral_steps[j] + mp6::mp6_net_round(
+                            expected_offset * 3.14159265358979323846 / 180.0 * rt.angle_to_step[0]));
+                        first_wire_after_setpoint = false;
+                    }
+                    if (j != 0) CHECK_EQ(target, g_app.mp6_runtimes[e0.id]->neutral_steps[j]);
+                }
+            }
+        }
+        CHECK(only_axis_moved);
+        CHECK(std::abs(e0.mp6.axis_test_offset_deg[0] - 5.0f) < 0.001f);
+        {
+            const double init[6] = {3.141592653589793, 0, 3.141592653589793, 0, 3.141592653589793, 0};
+            const double xoff[6] = {5.235987755982989, 4.1887902047863905, 1.0471975511965976, 0, 3.141592653589793, 2.0943951023931953};
+            CHECK(e0.mp6.viz.axis_test_active && e0.mp6.viz.axis_test_geometry_valid);
+            CHECK(rt.design.crank_length_mm > 0.0);
+            CHECK(std::abs(rt.design.crank_length_mm - 230.0) < 1e-9);
+            CHECK(std::abs(rt.design.rod_length_mm - 645.0) < 1e-9);
+            for (int j = 0; j < 6; ++j) {
+                CHECK(std::abs(e0.mp6.viz.rod_top[j][0]
+                    - (rt.geometry.top_attachment_mm[j][0] + rt.x_offset_mm)) < 0.002);
+                CHECK(std::abs(e0.mp6.viz.rod_top[j][2]
+                    - (rt.geometry.top_attachment_mm[j][2] + rt.z_offset_mm)) < 0.002);
+                for (int c = 0; c < 3; ++c)
+                    CHECK(std::abs(e0.mp6.viz.axis_test_plate[j][c]
+                        - e0.mp6.viz.rod_top[j][c]) < 0.002);
+                CHECK(std::abs(e0.mp6.viz.axis_test_plate[j][2] - 540.0) < 0.002);
+                const double commanded = rt.neutral_crank_rad[j]
+                    + (rt.axis_test_last_sent_steps[j] - rt.neutral_steps[j]) / rt.angle_to_step[j];
+                const double a = commanded + init[j];
+                const double expected_joint[3] = {
+                    rt.geometry.base_pivot_mm[j][0] + 230.0 * std::cos(a) * std::cos(xoff[j]),
+                    rt.geometry.base_pivot_mm[j][1] + 230.0 * std::cos(a) * std::sin(xoff[j]),
+                    rt.geometry.base_pivot_mm[j][2] + 230.0 * std::sin(a)};
+                for (int c = 0; c < 3; ++c)
+                    CHECK(std::abs(e0.mp6.viz.crank_joint[j][c] - expected_joint[c]) < 0.002);
+                if (j != 0) {
+                    const auto neutral = mp6::Mp6CrankSolver::crank_joint_from_angle_aim(
+                        rt.geometry, j, 230.0, rt.neutral_crank_rad[j]);
+                    for (int c = 0; c < 3; ++c)
+                        CHECK(std::abs(e0.mp6.viz.crank_joint[j][c] - neutral[c]) < 0.002);
+                }
+            }
+        }
+        CHECK(g_app.mp6AxisTest(e0, true, 0, e0.mp6.axis_test_setpoint_deg[0] > 1.0f ? 1.0 : e0.mp6.axis_test_setpoint_deg[0], 1, 2, false, &why));
+        CHECK_EQ(e0.mp6.axis_test_cap_deg[0], 1.0f);
+        CHECK_EQ(e0.mp6.axis_test_setpoint_deg[0], 1.0f);
+        float cap_prior = e0.mp6.axis_test_offset_deg[0];
+        bool cap_slewed = false;
+        for (int i = 0; i < 160 && e0.mp6.axis_test_offset_deg[0] > 1.0001f; ++i) {
+            feedSupplyAxes(link, ax);
+            link->inject(makeType48(1, 0x03, ax, pairing));
+            g_app.frame_time += 0.02;
+            g_app.update();
+            const float current = e0.mp6.axis_test_offset_deg[0];
+            CHECK(current <= cap_prior + 0.001f);
+            CHECK(cap_prior - current <= 2.0f * 0.0201f + 0.001f);
+            cap_prior = current;
+            const int expected_current = rt.neutral_steps[0] + mp6::mp6_net_round(
+                current * 3.14159265358979323846 / 180.0 * rt.angle_to_step[0]);
+            for (const auto& w : link->takeWrites()) if (w.size() >= 18 && w[0] == 0xFE && w[1] == 0xFC && w[2] == 2) {
+                const int target = read_cmd2(w, 0);
+                CHECK_EQ(target, expected_current);
+            }
+            if (current <= 1.0001f) cap_slewed = true;
+        }
+        CHECK(cap_slewed);
+        CHECK(set_axis(1, 5.0, 5.0).find("\"ok\":true") != std::string::npos);
+        e0.mp6.axis_test_slew_deg_s = 30.0f;
+        const float ramp_prior = e0.mp6.axis_test_offset_deg[0];
+        g_app.frame_time += 0.020;
+        g_app.update();
+        CHECK(e0.mp6.viz.axis_test_active && e0.mp6.viz.axis_test_geometry_valid);
+        CHECK(e0.mp6.axis_test_offset_deg[0] > ramp_prior);
+        CHECK(std::abs(e0.mp6.axis_test_offset_deg[0] - ramp_prior - 0.6f) < 0.002f);
+        {
+            const double angle = rt.neutral_crank_rad[0]
+                + (rt.axis_test_last_sent_steps[0] - rt.neutral_steps[0]) / rt.angle_to_step[0]
+                + 3.141592653589793;
+            const double xoff = 5.235987755982989;
+            const double expected[3] = {
+                rt.geometry.base_pivot_mm[0][0] + 230.0 * std::cos(angle) * std::cos(xoff),
+                rt.geometry.base_pivot_mm[0][1] + 230.0 * std::cos(angle) * std::sin(xoff),
+                rt.geometry.base_pivot_mm[0][2] + 230.0 * std::sin(angle)};
+            for (int c = 0; c < 3; ++c)
+                CHECK(std::abs(e0.mp6.viz.crank_joint[0][c] - expected[c]) < 0.002);
+        }
+        pump_ticks(5);
+        int last_axis_target = INT_MIN;
+        for (const auto& w : link->takeWrites()) if (w.size() >= 18 && w[2] == 2)
+            last_axis_target = (static_cast<int>(w[3]) | (static_cast<int>(w[4]) << 8)) - 32767;
+        CHECK_EQ(last_axis_target, e0.mp6.axis_test_target_steps[0]);
+        // Force a tight travel boundary and prove the absolute-angle clamp is authoritative.
+        const double old_max = rt.max_rad;
+        rt.max_rad = rt.neutral_crank_rad[0] + 0.05;
+        response = set_axis(1, 10.0, 15.0);
+        CHECK(response.find("\"ok\":true") != std::string::npos);
+        for (int i = 0; i < 250; ++i) pump_ticks(1);
+        CHECK(e0.mp6.axis_test_offset_deg[0] <= 0.05f * 180.0f / 3.14159265f + 0.01f);
+        rt.max_rad = old_max;
+
+        CHECK(g_app.mp6AxisTest(e0, false, -1, 0, 15, 2, false, &why));
+        float return_prior = e0.mp6.axis_test_offset_deg[0];
+        for (int i = 0; i < 200 && (e0.mp6.axis_test_offset_deg[0] != 0.0f || rt.axis_test_returning); ++i) {
+            pump_ticks(1);
+            CHECK(std::abs(e0.mp6.axis_test_offset_deg[0] - return_prior) <= 2.0f * 0.0161f + 0.001f);
+            return_prior = e0.mp6.axis_test_offset_deg[0];
+        }
+        CHECK(!e0.mp6.axis_test_enabled);
+        CHECK(!rt.axis_test_returning);
+        g_app.update();
+        CHECK(!e0.mp6.viz.axis_test_active);
+        CHECK(rt.start_blend_active);
+        CHECK(rt.start_blend_start == rt.axis_test_last_sent_steps);
+        pump_ticks(50);
+        g_app.update();
+        CHECK(!e0.mp6.viz.axis_test_active);
+        CHECK(e0.mp6.viz.rod_lines_valid);
+        {
+            mp6::Mp6Pose pose;
+            pose.lon_mm = e0.mp6.target_pose[0];
+            pose.lat_mm = e0.mp6.target_pose[1];
+            pose.vert_mm = e0.mp6.target_pose[2];
+            pose.roll = e0.mp6.target_pose[3];
+            pose.pitch = e0.mp6.target_pose[4];
+            pose.yaw = e0.mp6.target_pose[5];
+            auto expected_tops = rt.geometry.top_attachment_mm;
+            mp6::mp6_transform_points(expected_tops, pose, rt.x_offset_mm, rt.z_offset_mm);
+            for (int c = 0; c < 3; ++c)
+                CHECK(std::abs(e0.mp6.viz.rod_top[0][c] - expected_tops[0][c]) < 0.002);
+        }
+
+        CHECK(g_app.mp6AxisTest(e0, true, -1, 0, -1, 2, false, &why));
+        entry_done = false;
+        for (int i = 0; i < 3000 && !entry_done; ++i) {
+            pump_ticks(1);
+            entry_done = !e0.mp6.axis_test_entering;
+        }
+        CHECK(entry_done);
+        CHECK(rt.axis_test_last_sent_steps == rt.neutral_steps);
+        response = set_axis(1, 2.0, 5.0);
+        CHECK(response.find("\"ok\":true") != std::string::npos);
+        pump_ticks(100);
+        CHECK(e0.mp6.axis_test_offset_deg[0] > 1.9f);
+        {
+            const int measured_steps = rt.neutral_steps[0] + 321;
+            Axes measured_ax = ax;
+            measured_ax[0] = static_cast<std::uint16_t>(std::clamp(mp6::mp6_net_round(
+                (measured_steps - parsed_cal[0].p_offset) * 8.0 / parsed_cal[0].p_scale), 0.0, 65535.0));
+            link->inject(makeType48(1, 0x03, measured_ax, pairing));
+            g_app.frame_time += 0.02;
+            g_app.update();
+            CHECK_EQ(e0.mp6.feedback_cal[0], measured_steps);
+            CHECK(e0.mp6.viz.measured_crank_valid[0]);
+            const double init = 3.141592653589793;
+            const double xoff = 5.235987755982989;
+            const double a = rt.neutral_crank_rad[0] + 321.0 / rt.angle_to_step[0] + init;
+            const double expected_joint[3] = {
+                rt.geometry.base_pivot_mm[0][0] + 230.0 * std::cos(a) * std::cos(xoff),
+                rt.geometry.base_pivot_mm[0][1] + 230.0 * std::cos(a) * std::sin(xoff),
+                rt.geometry.base_pivot_mm[0][2] + 230.0 * std::sin(a)};
+            for (int c = 0; c < 3; ++c)
+                CHECK(std::abs(e0.mp6.viz.measured_crank_joint[0][c] - expected_joint[c]) < 0.002);
+        }
+        CHECK(g_app.mp6AxisTest(e0, false, -1, 0, -1, 0.1, false, &why));
+        pump_ticks(5, 0.020);
+        CHECK(rt.axis_test_returning);
+        CHECK(e0.mp6.axis_test_offset_deg[0] < 2.0f);
+        CHECK(e0.mp6.axis_test_offset_deg[0] > 1.9f);
+        CHECK(g_app.mp6AxisTest(e0, true, -1, 0, -1, 0.1, false, &why));
+        CHECK(!rt.axis_test_returning);
+        CHECK(!rt.axis_test_return_waiting_tx);
+        CHECK(!rt.start_blend_active);
+        CHECK(!rt.start_blend_pending);
+        entry_done = false;
+        for (int i = 0; i < 3000 && !entry_done; ++i) {
+            pump_ticks(1, 0.020);
+            entry_done = !e0.mp6.axis_test_entering;
+        }
+        CHECK(entry_done && !rt.axis_test_entering);
+        CHECK(!e0.mp6.axis_test_returning);
+        CHECK(!rt.axis_test_returning);
+        CHECK(!rt.start_blend_active);
+        CHECK(!rt.start_blend_pending);
+        CHECK(rt.axis_test_last_sent_steps == rt.neutral_steps);
+        response = set_axis(1, 0.1, 5.0);
+        CHECK(response.find("\"ok\":true") != std::string::npos);
+        bool setpoint_on_wire = false;
+        for (int i = 0; i < 100 && !setpoint_on_wire; ++i) {
+            pump_ticks(1, 0.020);
+            for (const auto& w : link->takeWrites()) if (w.size() >= 18 && w[0] == 0xFE && w[1] == 0xFC && w[2] == 2)
+                setpoint_on_wire = read_cmd2(w, 0) != rt.neutral_steps[0];
+        }
+        CHECK(setpoint_on_wire);
+
+        // Dispatch real session transitions; an ACK cannot re-arm axis test.
+        for (Mp6Intent intent : {Mp6Intent::Stop, Mp6Intent::Shutdown, Mp6Intent::Park}) {
+            e0.mp6.axis_test_enabled = true;
+            e0.mp6.axis_test_entering = true;
+            e0.mp6.axis_test_offset_deg[0] = 1.0f;
+            CHECK(g_app.mp6Command(e0, intent, &why));
+            CHECK(!e0.mp6.axis_test_enabled);
+            CHECK(!e0.mp6.axis_test_entering);
+            CHECK_EQ(e0.mp6.axis_test_offset_deg[0], 0.0f);
+            pump_ticks(1);
+            CHECK(e0.mp6.pending_intent == Mp6Intent::None);
+            CHECK(!e0.mp6.axis_test_enabled);
+            CHECK(!e0.mp6.axis_test_entering);
+            if (intent == Mp6Intent::Stop) CHECK(rt.session->state() == mp6::State::Stopped);
+            if (intent == Mp6Intent::Shutdown) {
+                CHECK(e0.mp6.shutdown_pending);
+                CHECK(g_app.mp6Command(e0, Mp6Intent::Stop, &why));
+                pump_ticks(1);
+                CHECK(!e0.mp6.shutdown_pending);
+            }
+            if (intent == Mp6Intent::Park) {
+                CHECK(e0.mp6.lifecycle == Mp6Lifecycle::Parking);
+                CHECK(g_app.mp6Command(e0, Mp6Intent::Stop, &why));
+                pump_ticks(1);
+            }
+        }
+        link->inject(makeType43(57));
+        pump_ticks(3);
+        CHECK(!e0.mp6.axis_test_enabled);
+        CHECK(!e0.mp6.axis_test_entering);
+        CHECK(g_app.mp6Command(e0, Mp6Intent::Initialize, &why));
+        for (int i = 0; i < 2000 && e0.mp6.lifecycle != Mp6Lifecycle::Parked; ++i) pump_ticks(1);
+        CHECK(e0.mp6.lifecycle == Mp6Lifecycle::Parked);
+        e0.mp6.step_target_valid = true;
+        for (int i = 0; i < 6; ++i) e0.mp6.step_target[i] = rt.neutral_steps[i];
+        g_app.frame_time += 0.016;
+        g_app.mp6UpdateEntity(e0);
+        g_app.startMotion();
+        pump_ticks(80);
+        CHECK(e0.mp6.lifecycle == Mp6Lifecycle::Running);
+        memset(e0.state.input_pct, 0, sizeof(e0.state.input_pct));
+    }
+
 
     // Verify command-2 frames are actively streaming in Running state
     auto running_writes = link->takeWrites();
@@ -914,14 +1338,26 @@ reconnect:
     }
 
     bool reached_safeoff = false;
+    bool observed_docked = false;
+    bool docked_refusal_checked = false;
     for (int i = 0; i < 2000; ++i) {
         pump_ticks(1);
+        if (e0.mp6.lifecycle == Mp6Lifecycle::Docked) {
+            observed_docked = true;
+            if (mode == "axistest" && !docked_refusal_checked) {
+                std::string why;
+                CHECK(!g_app.mp6AxisTest(e0, true, -1, 0, 5, 2, false, &why));
+                CHECK(why.find("Running") != std::string::npos);
+                docked_refusal_checked = true;
+            }
+        }
         if (e0.mp6.lifecycle == Mp6Lifecycle::SafeOff) {
             reached_safeoff = true;
             break;
         }
     }
     CHECK(reached_safeoff);
+    if (mode == "axistest") CHECK(observed_docked);
     CHECK_EQ(static_cast<int>(e0.mp6.lifecycle), static_cast<int>(Mp6Lifecycle::SafeOff));
     // Motors are now unpowered
     CHECK(!g_app.mp6IsMotorPowerRequested(e0));
@@ -948,7 +1384,50 @@ reconnect:
     CHECK_EQ(draft.point_zero_z_mm, 0);
 
     // 15. E-Stop latching
+    if (mode == "axistest") {
+        Ard fault_ard{};
+        fault_ard[8] = 210;
+        e0.mp6.axis_test_enabled = true;
+        e0.mp6.axis_test_setpoint_deg[0] = 1.0f;
+        e0.mp6.axis_test_offset_deg[0] = 1.0f;
+        e0.mp6.viz.axis_test_active = true;
+        e0.mp6.viz.axis_test_geometry_valid = true;
+        link->inject(makeType48(9, 3, ax, fault_ard));
+        g_app.update();
+        CHECK_EQ(e0.mp6.fault_code, 210);
+        CHECK(!e0.mp6.viz.axis_test_active);
+        CHECK(!e0.mp6.viz.axis_test_geometry_valid);
+
+        e0.mp6.axis_test_enabled = true;
+        e0.mp6.viz.axis_test_active = true;
+        link->close();
+        g_app.update();
+        CHECK(e0.mp6.lifecycle == Mp6Lifecycle::Disconnected);
+        CHECK(!e0.mp6.viz.axis_test_active);
+    }
     g_app.requestEstop();
+    if (mode == "axistest") {
+        CHECK(!e0.mp6.axis_test_enabled);
+        CHECK_EQ(e0.mp6.axis_test_offset_deg[0], 0.0f);
+        e0.mp6.viz.axis_test_active = true;
+        e0.mp6.viz.axis_test_geometry_valid = true;
+        e0.mp6.viz.measured_crank_valid[0] = true;
+        g_app.mp6Disconnect(e0);
+        CHECK(!e0.mp6.axis_test_enabled);
+        CHECK(!e0.mp6.viz.axis_test_active);
+        CHECK(!e0.mp6.viz.axis_test_geometry_valid);
+        CHECK(!e0.mp6.viz.measured_crank_valid[0]);
+        e0.enabled = false;
+        e0.mp6.viz.axis_test_active = true;
+        e0.mp6.viz.axis_test_geometry_valid = true;
+        e0.mp6.viz.rod_lines_valid = true;
+        e0.mp6.viz.measured_crank_valid[0] = true;
+        g_app.update();
+        CHECK(!e0.mp6.viz.axis_test_active);
+        CHECK(!e0.mp6.viz.axis_test_geometry_valid);
+        CHECK(!e0.mp6.viz.rod_lines_valid);
+        CHECK(!e0.mp6.viz.measured_crank_valid[0]);
+    }
     CHECK(e0.mp6.estop_latched);
     CHECK(!g_app.motion_started);
 
@@ -1134,7 +1613,7 @@ void testBoundaries() {
         cJSON_Delete(document);
     }
 
-    for (const char* command : {"mp6_disconnect", "mp6_connect", "mp6_command", "mp6_controller_settings"}) {
+    for (const char* command : {"mp6_disconnect", "mp6_connect", "mp6_command", "mp6_axis_test", "mp6_controller_settings"}) {
         for (const char* id : {"999", "1", "\"999\"", "0.9", "null", "true", "-1", "2147483648", "1e100"}) {
             std::string request = std::string("{\"cmd\":\"") + command + "\",\"args\":{\"entity\":" + id + "}}";
             cJSON* reply = cJSON_Parse(DispatchControlCommand(request).c_str());
@@ -1208,10 +1687,19 @@ void testBoundaries() {
     }
 }
 
-int main() {
-    for (const char* mode : {"normal", "lostack", "pressureoff", "wirefloat", "potround", "stepround", "savedzero", "priority", "badreplacement", "configurestop", "stale", "failedrefresh", "startstop", "parkedstop", "stagedstartstop", "dockedstop", "shutdownstop", "perstart", "jump", "disabled", "recovery", "quant0", "quant1", "quant2", "quant3", "quant4", "quant5"})
-        runScenario(mode);
-    testBoundaries();
+int main(int argc, char** argv) {
+    if (argc == 2) runScenario(argv[1]);
+    else {
+        for (const char* mode : {"normal", "lostack", "pressureoff", "wirefloat", "potround", "stepround", "savedzero", "priority", "badreplacement", "configurestop", "stale", "failedrefresh", "startstop", "parkedstop", "stagedstartstop", "dockedstop", "shutdownstop", "perstart", "jump", "disabled", "recovery", "axistest", "quant0", "quant1", "quant2", "quant3", "quant4", "quant5"})
+            runScenario(mode);
+        testBoundaries();
+    }
+    auto axis_type_error = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":0,"axis":1.5,"offset_deg":1}})");
+    CHECK(axis_type_error.find("axis must be an integer") != std::string::npos);
+    axis_type_error = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":0,"enable":1}})");
+    CHECK(axis_type_error.find("JSON booleans") != std::string::npos);
+    axis_type_error = DispatchControlCommand(R"({"cmd":"mp6_axis_test","args":{"entity":0,"offset_deg":"NaN"}})");
+    CHECK(axis_type_error.find("offset_deg must be a finite") != std::string::npos);
     printf("Total desktop checks: %d, failures: %d\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

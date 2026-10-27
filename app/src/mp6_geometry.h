@@ -254,6 +254,11 @@ class Mp6CrankSolver {
 public:
     Mp6CrankSolver() = default;
 
+    // Forward crank geometry for the solver's angle-aim + zero convention.
+    static Mp6Point3 crank_joint_from_angle_aim(const Mp6GeometrySetup& geometry,
+                                                int axis, double crank_length_mm,
+                                                double angle_aim_plus_zero_rad);
+
     // Builds the per-axis crank tables and resets the prior solution.
     //   geometry        : base pivots (crank axes) and top attachments (mm)
     //   rod_length_mm   : per-axis RodLength (Module2.RodLength, double)

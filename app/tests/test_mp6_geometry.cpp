@@ -970,6 +970,13 @@ void testSolverZeroPose() {
         CHECK(std::fabs(static_cast<double>(res.axis[i].step_target)) < 4096);
         CHECK(!mp6::mp6_step_word_reserved(res.axis[i].step_target));
     }
+
+    const auto joint = mp6::Mp6CrankSolver::crank_joint_from_angle_aim(
+        f.setup, 0, f.cfg.crank_length_mm.value, 0.125);
+    const double angle = 0.125 + crank_init[0];
+    CHECK_NEAR(joint[0], f.setup.base_pivot_mm[0][0] + f.cfg.crank_length_mm.value * std::cos(angle) * std::cos(crank_x_off[0]), 1e-9);
+    CHECK_NEAR(joint[1], f.setup.base_pivot_mm[0][1] + f.cfg.crank_length_mm.value * std::cos(angle) * std::sin(crank_x_off[0]), 1e-9);
+    CHECK_NEAR(joint[2], f.setup.base_pivot_mm[0][2] + f.cfg.crank_length_mm.value * std::sin(angle), 1e-9);
 }
 
 void testSolverMoves() {

@@ -129,7 +129,7 @@ class LifecycleTests(unittest.TestCase):
         by_name = {tool.name: tool for tool in tools}
         self.assertTrue(by_name["stewart_launch"].inputSchema["properties"]["documentation_mode"]["default"])
         for name in ["stewart_ui_get", "stewart_ui_set", "stewart_docs_fixture", "stewart_screenshot", "stewart_wait_frames", "stewart_capabilities",
-                     "stewart_mp6_status", "stewart_mp6_connect", "stewart_mp6_disconnect", "stewart_mp6_command", "stewart_mp6_config_import", "stewart_mp6_controller_settings"]:
+                     "stewart_mp6_status", "stewart_mp6_connect", "stewart_mp6_disconnect", "stewart_mp6_command", "stewart_mp6_axis_test", "stewart_mp6_config_import", "stewart_mp6_controller_settings"]:
             self.assertIn(name, by_name)
 
     def test_mp6_wrappers_and_add_entity_backend(self):
@@ -147,6 +147,11 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(call.call_args.args, ("mp6_command", {"entity": 3, "intent": "configure"}))
             bridge.stewart_mp6_command(3, "shutdown")
             self.assertEqual(call.call_args.args, ("mp6_command", {"entity": 3, "intent": "shutdown"}))
+            bridge.stewart_mp6_axis_test(3, enable=True, axis=2, offset_deg=2.0, cap_deg=5.0, slew_deg_s=2.0)
+            self.assertEqual(call.call_args.args, ("mp6_axis_test", {"entity": 3, "enable": True, "axis": 2,
+                             "offset_deg": 2.0, "cap_deg": 5.0, "slew_deg_s": 2.0}))
+            bridge.stewart_mp6_axis_test(neutral_all=True)
+            self.assertEqual(call.call_args.args, ("mp6_axis_test", {"neutral_all": True}))
             bridge.stewart_mp6_config_import(3, "Step/Rev\tv")
             self.assertEqual(call.call_args.args, ("mp6_config_import", {"entity": 3, "text": "Step/Rev\tv"}))
             bridge.stewart_mp6_controller_settings(3, pid_index=0, comms_timeout_ms=1000, pressure_aim_psi=30)

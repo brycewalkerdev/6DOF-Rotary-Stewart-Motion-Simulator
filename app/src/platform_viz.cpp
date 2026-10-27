@@ -309,8 +309,9 @@ void DrawPlatformViz(ImDrawList* dl, ImVec2 origin, ImVec2 size,
         ImVec4 ecol(e.color[0], e.color[1], e.color[2], 1.0f);
         ImU32 plat_col = IM_COL32((int)(ecol.x*220), (int)(ecol.y*220), (int)(ecol.z*220), 230);
         bool have_pose = e.mp6.feedback_pose_valid || e.mp6.target_pose_valid;
-        const float* pose = e.mp6.feedback_pose_valid ? e.mp6.feedback_pose
-                                                      : e.mp6.target_pose;
+        const float neutral_pose[6] = {};
+        const float* pose = e.mp6.viz.axis_test_active ? neutral_pose
+            : (e.mp6.feedback_pose_valid ? e.mp6.feedback_pose : e.mp6.target_pose);
         bool have_radii = e.mp6.design.bot_b_mm > 1.0f
             ? (e.mp6.design.top_b_mm > 1.0f)
             : (e.mp6.design.base_radius_mm > 1.0f
@@ -359,7 +360,7 @@ void DrawPlatformViz(ImDrawList* dl, ImVec2 origin, ImVec2 size,
                      v3((hp[k].x + hp[(k + 1) % 6].x) * 0.5f,
                         (hp[k].y + hp[(k + 1) % 6].y) * 0.5f, 0.0f));
 
-            if (have_pose) {
+            if (have_pose || e.mp6.viz.axis_test_active) {
                 // R = Rz(yaw) * Ry(pitch) * Rx(roll) applied to the platform
                 // hexagon, then translated by the pose translation.
                 float roll = pose[3], pitch = pose[4], yaw = pose[5];
@@ -375,14 +376,21 @@ void DrawPlatformViz(ImDrawList* dl, ImVec2 origin, ImVec2 size,
                 Vec3 tp[6];
                 for (int k = 0; k < 6; k++) {
                     float a = k * (float)M_PI / 3.0f;
-                    tp[k] = xform(top_b * cosf(a), top_b * sinf(a), 0.0f);
+                    tp[k] = e.mp6.viz.axis_test_active
+                        ? v3(e.mp6.viz.axis_test_plate[k][0], e.mp6.viz.axis_test_plate[k][1],
+                             e.mp6.viz.axis_test_plate[k][2])
+                        : xform(top_b * cosf(a), top_b * sinf(a), 0.0f);
                 }
                 for (int k = 0; k < 6; k++)
                     add3(tp[k], tp[(k + 1) % 6], plat_col, 2.0f,
                          v3((tp[k].x + tp[(k + 1) % 6].x) * 0.5f,
                             (tp[k].y + tp[(k + 1) % 6].y) * 0.5f,
                             (tp[k].z + tp[(k + 1) % 6].z) * 0.5f));
-                Vec3 tc = xform(0, 0, 0);
+                Vec3 tc = e.mp6.viz.axis_test_active
+                    ? v3((tp[0].x + tp[1].x + tp[2].x + tp[3].x + tp[4].x + tp[5].x) / 6.0f,
+                         (tp[0].y + tp[1].y + tp[2].y + tp[3].y + tp[4].y + tp[5].y) / 6.0f,
+                         (tp[0].z + tp[1].z + tp[2].z + tp[3].z + tp[4].z + tp[5].z) / 6.0f)
+                    : xform(0, 0, 0);
                 ImVec2 pc6 = project(tc, camera, center, half_h);
                 dl->AddCircle(pc6, 5.0f, plat_col, 12, 1.5f);
             }
@@ -391,7 +399,8 @@ void DrawPlatformViz(ImDrawList* dl, ImVec2 origin, ImVec2 size,
             // joints (crank rotation axes, crank ends, transformed top
             // attachments). Nothing here invents or rescales a joint
             // placement; a fresh solve owns rod_lines_valid.
-            if (e.mp6.viz.solver_ready) {
+            if (e.mp6.viz.solver_ready && (!e.mp6.viz.axis_test_active
+                    ? e.mp6.viz.rod_lines_valid : e.mp6.viz.axis_test_geometry_valid)) {
                 for (int k = 0; k < 6; k++) {
                     Vec3 piv = v3(e.mp6.viz.base_pivot[k][0], e.mp6.viz.base_pivot[k][1],
                                   e.mp6.viz.base_pivot[k][2]);
@@ -410,6 +419,12 @@ void DrawPlatformViz(ImDrawList* dl, ImVec2 origin, ImVec2 size,
                     add3(crk, top,
                          e.mp6.viz.axis_ok[k] ? plat_col : rod_bad_col,
                          e.mp6.viz.axis_ok[k] ? 2.5f : 2.0f, top);
+                    if (e.mp6.viz.axis_test_active && e.mp6.viz.measured_crank_valid[k]) {
+                        Vec3 measured = v3(e.mp6.viz.measured_crank_joint[k][0],
+                                           e.mp6.viz.measured_crank_joint[k][1],
+                                           e.mp6.viz.measured_crank_joint[k][2]);
+                        add3(piv, measured, IM_COL32(210, 220, 240, 70), 1.5f, measured);
+                    }
                 }
             }
 
@@ -437,6 +452,14 @@ void DrawPlatformViz(ImDrawList* dl, ImVec2 origin, ImVec2 size,
             mode_col = IM_COL32(120, 120, 130, 160);
         }
         dl->AddText(ImVec2(origin.x + 4, origin.y + 2), mode_col, mode_label);
+        if (e.mp6.viz.axis_test_active) {
+            dl->AddText(ImVec2(origin.x + 4, origin.y + 30), IM_COL32(235, 210, 150, 220),
+                "Axis test: commanded cranks (solid) vs measured (faint); platform shown at neutral, not a solved pose");
+            if (!e.mp6.viz.axis_test_geometry_valid)
+                dl->AddText(ImVec2(origin.x + 4, origin.y + 44), IM_COL32(255, 100, 80, 230),
+                            e.mp6.last_error[0] ? e.mp6.last_error
+                                : (e.mp6.solver_note[0] ? e.mp6.solver_note : "neutral/solver data unavailable"));
+        }
         if (have_radii) {
             char geo[128];
             if (e.mp6.step_target_valid)

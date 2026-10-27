@@ -323,6 +323,17 @@ void Mp6CrankSolver::build_tables() {
     }
 }
 
+Mp6Point3 Mp6CrankSolver::crank_joint_from_angle_aim(
+    const Mp6GeometrySetup& geometry, int axis, double crank_length_mm,
+    double angle_aim_plus_zero_rad) {
+    const double angle = angle_aim_plus_zero_rad + kCrankInit[axis];
+    const double caos = std::sin(kCrankXOffset[axis]);
+    const double caoc = std::cos(kCrankXOffset[axis]);
+    return {geometry.base_pivot_mm[axis][0] + crank_length_mm * std::cos(angle) * caoc,
+            geometry.base_pivot_mm[axis][1] + crank_length_mm * std::cos(angle) * caos,
+            geometry.base_pivot_mm[axis][2] + crank_length_mm * std::sin(angle)};
+}
+
 bool Mp6CrankSolver::init(const Mp6GeometrySetup& geometry,
                           const std::array<double, kAxes>& rod_length_mm,
                           double crank_length_mm, double min_rad, double max_rad,
@@ -516,9 +527,11 @@ void Mp6CrankSolver::solve(const std::array<Mp6Point3, kAxes>& target_mm,
         }
 
         // Crank joint + residual gate (L18435..L18439, L17215..L17620).
-        double xc = pivot_[i][0] + crank_length_ * std::cos(num5) * caocos_[i];
-        double yc = pivot_[i][1] + crank_length_ * std::cos(num5) * caosin_[i];
-        double zc = pivot_[i][2] + crank_length_ * std::sin(num5);
+        const Mp6Point3 crank_joint = crank_joint_from_angle_aim(
+            Mp6GeometrySetup{pivot_, {}}, i, crank_length_, num5 - kCrankInit[i]);
+        double xc = crank_joint[0];
+        double yc = crank_joint[1];
+        double zc = crank_joint[2];
         const double dx = xc - t_x;
         const double dy = yc - t_y;
         const double dz = zc - t_z;

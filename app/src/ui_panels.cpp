@@ -3548,6 +3548,77 @@ static void DrawMp6SettingsContent(Entity& e) {
                     e.mp6.pressure_valid ? "" : "(stale) ",
                     e.mp6.pneu_psi, e.mp6.pneu_aim_psi);
 
+        ImGui::Separator();
+        ImGui::Text("Axis test (commissioning)");
+        ImGui::TextWrapped("Moves crank targets directly while enabled. Use only with the rig clear and under direct supervision; pose input is ignored.");
+        std::string axis_reason;
+        bool axis_allowed = g_app.mp6AxisTestAllowed(e, &axis_reason);
+        bool axis_enabled = e.mp6.axis_test_enabled;
+        ImGui::BeginDisabled(!axis_allowed && !axis_enabled);
+        if (ImGui::Checkbox("Enable axis test##mp6", &axis_enabled)) {
+            std::string why;
+            if (!g_app.mp6AxisTest(e, axis_enabled, -1, 0, -1, e.mp6.axis_test_slew_deg_s, false, &why))
+                snprintf(e.mp6.last_error, sizeof(e.mp6.last_error), "%s", why.c_str());
+        }
+        ImGui::EndDisabled();
+        if (!axis_allowed && !e.mp6.axis_test_enabled) ImGui::TextDisabled("Unavailable: %s", axis_reason.c_str());
+        if (e.mp6.axis_test_entering) ImGui::TextDisabled("Entering: slewing commanded targets to neutral");
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.2f, 1.0f), "Commissioning motion can move hardware; verify clearance, direction, and emergency stop access.");
+        float cap = e.mp6.axis_test_cap_deg[0], slew = e.mp6.axis_test_slew_deg_s;
+        bool cap_changed = ImGui::SliderFloat("Cap all axes (deg)##mp6", &cap, 0.1f, 15.0f, "%.1f");
+        bool slew_changed = ImGui::SliderFloat("Slew (deg/s)##mp6", &slew, 0.1f, 30.0f, "%.1f");
+        ImGui::Checkbox("Single axis only##mp6", &e.mp6.axis_test_single_only);
+        if (cap_changed || slew_changed) {
+            std::string why;
+            if (!g_app.mp6AxisTest(e, e.mp6.axis_test_enabled, -1, 0, cap, slew, false, &why))
+                snprintf(e.mp6.last_error, sizeof(e.mp6.last_error), "%s", why.c_str());
+        }
+        if (e.mp6.axis_test_enabled) {
+            if (ImGui::Button("All to neutral##mp6")) {
+                std::string why;
+                g_app.mp6AxisTest(e, true, -1, 0, -1, slew, true, &why);
+            }
+            if (ImGui::BeginTable("##mp6_axis_test", 8, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableSetupColumn("Axis"); ImGui::TableSetupColumn("Cap deg"); ImGui::TableSetupColumn("Setpoint deg");
+                ImGui::TableSetupColumn("Offset deg"); ImGui::TableSetupColumn("Offset steps");
+                ImGui::TableSetupColumn("Target steps"); ImGui::TableSetupColumn("Feedback steps"); ImGui::TableSetupColumn("Return");
+                ImGui::TableHeadersRow();
+                for (int i = 0; i < 6; ++i) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::Text("%d", i + 1);
+                    ImGui::TableNextColumn();
+                    float axis_cap = e.mp6.axis_test_cap_deg[i];
+                    ImGui::SetNextItemWidth(78);
+                    if (ImGui::SliderFloat((std::string("##cap") + std::to_string(i)).c_str(), &axis_cap, 0.1f, 15.0f, "%.1f")) {
+                        std::string why;
+                        if (!g_app.mp6AxisTest(e, true, i, std::clamp(e.mp6.axis_test_setpoint_deg[i], -axis_cap, axis_cap), axis_cap, slew, false, &why))
+                            snprintf(e.mp6.last_error, sizeof(e.mp6.last_error), "%s", why.c_str());
+                    }
+                    ImGui::TableNextColumn();
+                    float setpoint = e.mp6.axis_test_setpoint_deg[i];
+                    ImGui::SetNextItemWidth(100);
+                    if (ImGui::SliderFloat((std::string("##axis") + std::to_string(i)).c_str(), &setpoint, -axis_cap, axis_cap, "%.2f")) {
+                        std::string why;
+                        if (!g_app.mp6AxisTest(e, true, i, setpoint, -1, slew, false, &why))
+                            snprintf(e.mp6.last_error, sizeof(e.mp6.last_error), "%s", why.c_str());
+                    }
+                    ImGui::TableNextColumn(); ImGui::Text("%.2f", e.mp6.axis_test_offset_deg[i]);
+                    ImGui::TableNextColumn(); ImGui::Text("%d", e.mp6.axis_test_offset_steps[i]);
+                    ImGui::TableNextColumn(); ImGui::Text("%d", e.mp6.axis_test_target_steps[i]);
+                    ImGui::TableNextColumn();
+                    if (e.mp6.feedback_valid && e.mp6.feedback_cal[i] != SHRT_MIN) ImGui::Text("%d", (int)e.mp6.feedback_cal[i]);
+                    else ImGui::TextDisabled("-");
+                    ImGui::TableNextColumn();
+                    if (ImGui::SmallButton((std::string("Neutral##axis") + std::to_string(i)).c_str())) {
+                        std::string why;
+                        if (!g_app.mp6AxisTest(e, true, i, 0, -1, slew, false, &why))
+                            snprintf(e.mp6.last_error, sizeof(e.mp6.last_error), "%s", why.c_str());
+                    }
+                }
+                ImGui::EndTable();
+            }
+        }
+
         // ── Controller Parameters & Pressure Plan ────────────────────────
         ImGui::Separator();
         ImGui::Text("Controller Parameters & Pressure Plan (NOT in .pltc)");

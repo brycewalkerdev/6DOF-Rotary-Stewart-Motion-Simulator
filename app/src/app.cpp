@@ -60,11 +60,23 @@ struct App::Mp6Runtime {
     mp6::PidProfile pending_pid_normal;
     bool pending_pid_valid = false;
     std::array<std::int32_t, 6> neutral_steps{};
+    std::array<double, 6> neutral_crank_rad{};
     bool neutral_valid = false;
     bool neutral_dirty = false;
     bool start_blend_pending = false;
     bool start_blend_active = false;
     double start_blend_begin = 0.0;
+    std::array<std::int32_t, 6> start_blend_start{};
+    bool axis_test_returning = false;
+    bool axis_test_entering = false;
+    bool axis_test_entry_waiting_tx = false;
+    std::array<std::int32_t, 6> axis_test_entry_steps{};
+    std::array<double, 6> axis_test_entry_position{};
+    std::array<std::int32_t, 6> axis_test_last_sent_steps{};
+    bool axis_test_last_sent_valid = false;
+    double axis_test_last_sent_time = 0.0;
+    bool axis_test_return_waiting_tx = false;
+    double axis_test_last_time = 0.0;
     // Typed parse of the stored pltc, kept for the crank-geometry rebuild
     // (rod/crank overrides, travel limits, angle_to_step calibration).
     mp6::Mp6PlatformConfig parsed_cfg;
@@ -73,8 +85,6 @@ struct App::Mp6Runtime {
     bool        geometry_dirty = false;
     mp6::Mp6DesignParams design;                 // table numbers as entered
     mp6::Mp6GeometrySetup geometry;              // pivots/attachments (z explicit)
-    double      rod_length_mm[6] = {};
-    double      crank_length_mm = 0.0;
     double      min_rad = 0.0, max_rad = 0.0;
     double      angle_zero_rad[6] = {};
     double      angle_to_step[6] = {};
@@ -2055,6 +2065,20 @@ bool App::mp6Connect(Entity& e, std::string* error) {
 
 void App::mp6Disconnect(Entity& e) {
     if (e.type != EntityType::HIL || e.hil_backend != HilBackend::MP6) return;
+    e.mp6.axis_test_enabled = false;
+    e.mp6.axis_test_entering = false;
+    e.mp6.axis_test_returning = false;
+    e.mp6.viz.axis_test_active = false;
+    e.mp6.viz.axis_test_geometry_valid = false;
+    e.mp6.viz.rod_lines_valid = false;
+    for (int i = 0; i < 6; ++i) e.mp6.viz.measured_crank_valid[i] = false;
+    if (auto it = mp6_runtimes.find(e.id); it != mp6_runtimes.end() && it->second) {
+        it->second->axis_test_entering = false;
+        it->second->axis_test_entry_waiting_tx = false;
+        it->second->axis_test_return_waiting_tx = false;
+    }
+    for (int i = 0; i < 6; ++i) e.mp6.axis_test_setpoint_deg[i] = e.mp6.axis_test_offset_deg[i] = 0.0f,
+        e.mp6.axis_test_offset_steps[i] = e.mp6.axis_test_target_steps[i] = 0;
     auto it = mp6_runtimes.find(e.id);
     if (it != mp6_runtimes.end()) {
         // Detach first so the session can never transmit through a link we are
@@ -2095,6 +2119,30 @@ bool App::mp6Command(Entity& e, Mp6Intent intent, std::string* error) {
     if (e.type != EntityType::HIL || e.hil_backend != HilBackend::MP6)
         return err("entity is not an MP6 HIL entity");
     if (intent == Mp6Intent::None) return err("no intent given");
+    if (intent == Mp6Intent::Stop || intent == Mp6Intent::Estop ||
+        intent == Mp6Intent::Park || intent == Mp6Intent::Shutdown ||
+        intent == Mp6Intent::Disconnect) {
+        e.mp6.axis_test_enabled = false;
+        e.mp6.axis_test_entering = false;
+        e.mp6.axis_test_returning = false;
+        e.mp6.axis_test_setpoint_deg[0] = e.mp6.axis_test_setpoint_deg[1] =
+        e.mp6.axis_test_setpoint_deg[2] = e.mp6.axis_test_setpoint_deg[3] =
+        e.mp6.axis_test_setpoint_deg[4] = e.mp6.axis_test_setpoint_deg[5] = 0.0f;
+        e.mp6.axis_test_offset_deg[0] = e.mp6.axis_test_offset_deg[1] =
+        e.mp6.axis_test_offset_deg[2] = e.mp6.axis_test_offset_deg[3] =
+        e.mp6.axis_test_offset_deg[4] = e.mp6.axis_test_offset_deg[5] = 0.0f;
+        e.mp6.axis_test_offset_steps[0] = e.mp6.axis_test_offset_steps[1] =
+        e.mp6.axis_test_offset_steps[2] = e.mp6.axis_test_offset_steps[3] =
+        e.mp6.axis_test_offset_steps[4] = e.mp6.axis_test_offset_steps[5] = 0;
+        for (int i = 0; i < 6; ++i) e.mp6.axis_test_target_steps[i] = 0;
+        auto rt = mp6_runtimes.find(e.id);
+        if (rt != mp6_runtimes.end() && rt->second) {
+            rt->second->axis_test_entering = false;
+            rt->second->axis_test_entry_waiting_tx = false;
+            rt->second->axis_test_returning = false;
+            rt->second->axis_test_return_waiting_tx = false;
+        }
+    }
     bool is_disconnect = (intent == Mp6Intent::Disconnect);
     auto runtime = mp6_runtimes.find(e.id);
     bool attached_safety = (intent == Mp6Intent::Stop || intent == Mp6Intent::Estop)
@@ -2167,6 +2215,107 @@ bool App::mp6Command(Entity& e, Mp6Intent intent, std::string* error) {
     snprintf(e.mp6.lifecycle_note, sizeof(e.mp6.lifecycle_note),
              "intent %d staged; dispatched and observed on the next update", (int)intent);
     log(e.id, "mp6", "Intent %d staged (dispatched by mp6UpdateEntity)", (int)intent);
+    return true;
+}
+
+bool App::mp6AxisTestAllowed(const Entity& e, std::string* reason) const {
+    auto fail = [&](const char* why) { if (reason) *reason = why; return false; };
+    if (e.type != EntityType::HIL || e.hil_backend != HilBackend::MP6) return fail("entity is not an MP6 HIL entity");
+    if (IsDocumentationMode()) return fail("axis test is unavailable in documentation mode");
+    auto it = mp6_runtimes.find(e.id);
+    if (it == mp6_runtimes.end() || !it->second || !it->second->session ||
+        it->second->session->state() != mp6::State::Running ||
+        it->second->start_blend_pending || it->second->start_blend_active)
+        return fail("axis test requires Running after the start blend completes");
+    if (!it->second->axis_test_last_sent_valid) return fail("axis test requires a transmitted command-2 target");
+    if (e.mp6.estop_latched || e.mp6.fault_latched) return fail("axis test blocked by E-STOP or fault latch");
+    if (!e.enabled) return fail("enable the MP6 entity first");
+    return true;
+}
+
+bool App::mp6AxisTest(Entity& e, bool enable, int axis, double offset_deg,
+                      double cap_deg, double slew_deg_s, bool neutral_all,
+                      std::string* error) {
+    auto err = [&](const char* why) { if (error) *error = why; return false; };
+    if (e.type != EntityType::HIL || e.hil_backend != HilBackend::MP6) return err("entity is not an MP6 HIL entity");
+    if (!std::isfinite(cap_deg) || (cap_deg >= 0.0 && (cap_deg < 0.1 || cap_deg > 15.0))) return err("cap_deg must be finite and between 0.1 and 15");
+    if (!std::isfinite(slew_deg_s) || slew_deg_s < 0.1 || slew_deg_s > 30.0) return err("slew_deg_s must be finite and between 0.1 and 30");
+    if (axis < -1 || axis > 5) return err("axis must be 1..6");
+    const double effective_cap = cap_deg >= 0.0 ? cap_deg : axis >= 0 ? e.mp6.axis_test_cap_deg[axis] : 15.0;
+    if (axis >= 0 && (!std::isfinite(offset_deg) || std::abs(offset_deg) > effective_cap)) return err("offset_deg exceeds the configured cap");
+    if (e.mp6.axis_test_entering && axis >= 0 && offset_deg != 0.0)
+        return err("axis test is entering neutral; nonzero setpoints are unavailable");
+    if (enable) {
+        std::string why;
+        if (!mp6AxisTestAllowed(e, &why)) { if (error) *error = why; return false; }
+        if (axis >= 0 && offset_deg != 0.0 && !e.mp6.axis_test_enabled &&
+            mp6_runtimes.at(e.id)->axis_test_last_sent_steps != mp6_runtimes.at(e.id)->neutral_steps)
+            return err("axis test is entering neutral; nonzero setpoints are unavailable");
+    }
+    if (e.mp6.axis_test_single_only && axis >= 0 && offset_deg != 0.0) {
+        for (int i = 0; i < 6; ++i) if (i != axis &&
+            (e.mp6.axis_test_setpoint_deg[i] != 0.0f || e.mp6.axis_test_offset_deg[i] != 0.0f))
+            return err("single-axis-only is enabled; return the other axis to neutral first");
+    }
+    if (cap_deg >= 0.0) {
+        if (axis >= 0) {
+            e.mp6.axis_test_cap_deg[axis] = (float)cap_deg;
+            e.mp6.axis_test_setpoint_deg[axis] = std::clamp(e.mp6.axis_test_setpoint_deg[axis], -(float)cap_deg, (float)cap_deg);
+        } else for (int i = 0; i < 6; ++i) {
+            e.mp6.axis_test_cap_deg[i] = (float)cap_deg;
+            e.mp6.axis_test_setpoint_deg[i] = std::clamp(e.mp6.axis_test_setpoint_deg[i], -(float)cap_deg, (float)cap_deg);
+        }
+    }
+    e.mp6.axis_test_slew_deg_s = (float)slew_deg_s;
+    if (neutral_all) {
+        for (float& v : e.mp6.axis_test_setpoint_deg) v = 0.0f;
+    } else if (axis >= 0) e.mp6.axis_test_setpoint_deg[axis] = (float)offset_deg;
+    if (!enable && e.mp6.axis_test_enabled) {
+        e.mp6.axis_test_enabled = false;
+        e.mp6.axis_test_entering = false;
+        e.mp6.axis_test_returning = true;
+        for (int i = 0; i < 6; ++i) e.mp6.axis_test_setpoint_deg[i] = 0.0f;
+        auto it = mp6_runtimes.find(e.id);
+        if (it != mp6_runtimes.end() && it->second) {
+            it->second->axis_test_entering = false;
+            it->second->axis_test_entry_waiting_tx = false;
+            it->second->axis_test_returning = true;
+            it->second->axis_test_return_waiting_tx = false;
+            if (it->second->axis_test_last_sent_valid) for (int i = 0; i < 6; ++i) {
+                const auto delta = it->second->axis_test_last_sent_steps[i] - it->second->neutral_steps[i];
+                e.mp6.axis_test_offset_steps[i] = delta;
+                e.mp6.axis_test_offset_deg[i] = static_cast<float>(delta / it->second->angle_to_step[i] * 180.0 / 3.14159265358979323846);
+            }
+        }
+    } else if (enable) {
+        const bool was_enabled = e.mp6.axis_test_enabled;
+        e.mp6.axis_test_enabled = true;
+        e.mp6.axis_test_returning = false;
+        if (auto it = mp6_runtimes.find(e.id); it != mp6_runtimes.end() && it->second) {
+            if (!was_enabled) {
+                auto& rt = *it->second;
+                const auto& sent = rt.axis_test_last_sent_steps;
+                rt.axis_test_returning = false;
+                rt.axis_test_return_waiting_tx = false;
+                rt.start_blend_pending = false;
+                rt.start_blend_active = false;
+                rt.axis_test_entering = false;
+                rt.axis_test_entry_waiting_tx = false;
+                e.mp6.axis_test_entering = false;
+                bool at_neutral = true;
+                for (int i = 0; i < 6; ++i) {
+                    rt.axis_test_entry_steps[i] = sent[i];
+                    rt.axis_test_entry_position[i] = sent[i];
+                    at_neutral = at_neutral && sent[i] == rt.neutral_steps[i];
+                }
+                rt.axis_test_entering = !at_neutral;
+                rt.axis_test_entry_waiting_tx = false;
+                rt.axis_test_last_sent_time = frame_time;
+                e.mp6.axis_test_entering = !at_neutral;
+            }
+            it->second->axis_test_last_time = frame_time;
+        }
+    }
     return true;
 }
 
@@ -2384,6 +2533,17 @@ void App::requestEstop() {
     for (auto& e : entities) {
         memset(e.state.input_pct, 0, sizeof(e.state.input_pct));
         if (e.type == EntityType::HIL && e.hil_backend == HilBackend::MP6) {
+            e.mp6.axis_test_enabled = false;
+            e.mp6.axis_test_entering = false;
+            e.mp6.axis_test_returning = false;
+            if (auto it = mp6_runtimes.find(e.id); it != mp6_runtimes.end() && it->second) {
+                it->second->axis_test_entering = false;
+                it->second->axis_test_entry_waiting_tx = false;
+                it->second->axis_test_returning = false;
+                it->second->axis_test_return_waiting_tx = false;
+            }
+            for (int i = 0; i < 6; ++i) e.mp6.axis_test_setpoint_deg[i] = e.mp6.axis_test_offset_deg[i] = 0.0f,
+                e.mp6.axis_test_offset_steps[i] = e.mp6.axis_test_target_steps[i] = 0;
             e.mp6.pending_intent = e.mp6.link_open ? Mp6Intent::Estop : Mp6Intent::None;
             e.mp6.estop_latched = true;
             snprintf(e.mp6.last_action, sizeof(e.mp6.last_action), "E-STOP staged");
@@ -2608,6 +2768,8 @@ void App::mp6UpdateEntity(Entity& e) {
                     rt.design.rod_length_mm = rod;
                     rt.design.crank_length_mm = crank;
                     rt.geometry = geo;
+                    rt.min_rad = tmin;
+                    rt.max_rad = tmax;
                     for (int i = 0; i < 6; i++) {
                         rt.angle_to_step[i] = ats[i];
                         rt.angle_zero_rad[i] = zeros[i];
@@ -2628,6 +2790,7 @@ void App::mp6UpdateEntity(Entity& e) {
                             break;
                         }
                         rt.neutral_steps[i] = zero_res.axis[i].step_target;
+                        rt.neutral_crank_rad[i] = zero_res.axis[i].angle_aim_rad + rt.angle_zero_rad[i];
                     }
                     rt.neutral_valid = neutral_ok;
                     if (neutral_ok) {
@@ -2701,11 +2864,63 @@ void App::mp6UpdateEntity(Entity& e) {
     // Command-2 onboard control: stream the fresh crank-solver step aims while
     // the session is Running or Parked. The session owns cadence/freshness guards; a
     // fault or Estop latch below stops feeding without any extra claim here.
+    if ((e.mp6.axis_test_enabled || rt.axis_test_entering) && (s.state() != mp6::State::Running || e.mp6.estop_latched || e.mp6.fault_latched)) {
+        e.mp6.axis_test_enabled = false;
+        e.mp6.axis_test_entering = false;
+        e.mp6.axis_test_returning = false;
+        rt.axis_test_entering = false;
+        rt.axis_test_entry_waiting_tx = false;
+        rt.axis_test_returning = false;
+        rt.axis_test_return_waiting_tx = false;
+        for (int i = 0; i < 6; ++i) e.mp6.axis_test_setpoint_deg[i] = e.mp6.axis_test_offset_deg[i] = 0.0f;
+    }
+    const bool axis_override = (e.mp6.axis_test_enabled || rt.axis_test_returning || rt.axis_test_entering) && s.state() == mp6::State::Running;
+    if (axis_override) {
+        const double dt = std::clamp(frame_time - rt.axis_test_last_time, 0.0, 0.1);
+        rt.axis_test_last_time = frame_time;
+        bool returned = true;
+        bool entered = true;
+        for (int i = 0; i < 6; ++i) {
+            if (rt.axis_test_entering) {
+                const double tx_dt = std::clamp(frame_time - rt.axis_test_last_sent_time, 0.0, 0.1);
+                const double max_steps = e.mp6.axis_test_slew_deg_s * tx_dt * 3.14159265358979323846 / 180.0 * std::abs(rt.angle_to_step[i]);
+                const double frame_steps = e.mp6.axis_test_slew_deg_s * dt * 3.14159265358979323846 / 180.0 * std::abs(rt.angle_to_step[i]);
+                rt.axis_test_entry_position[i] += std::clamp((double)rt.neutral_steps[i] - rt.axis_test_entry_position[i], -frame_steps, frame_steps);
+                const int max_sent_delta = (std::max)(1, (int)std::ceil(max_steps));
+                const int rounded_entry = mp6::mp6_net_round(rt.axis_test_entry_position[i]);
+                rt.axis_test_entry_steps[i] = std::clamp(rounded_entry,
+                    rt.axis_test_last_sent_steps[i] - max_sent_delta,
+                    rt.axis_test_last_sent_steps[i] + max_sent_delta);
+                e.mp6.axis_test_target_steps[i] = rt.axis_test_entry_steps[i];
+                e.mp6.axis_test_offset_steps[i] = rt.axis_test_entry_steps[i] - rt.neutral_steps[i];
+                e.mp6.axis_test_offset_deg[i] = static_cast<float>(e.mp6.axis_test_offset_steps[i] / rt.angle_to_step[i] * 180.0 / 3.14159265358979323846);
+                entered = entered && rt.axis_test_entry_steps[i] == rt.neutral_steps[i];
+                continue;
+            }
+            const double goal = e.mp6.axis_test_enabled
+                ? std::clamp((double)e.mp6.axis_test_setpoint_deg[i], -(double)e.mp6.axis_test_cap_deg[i], (double)e.mp6.axis_test_cap_deg[i])
+                : 0.0;
+            const double step = e.mp6.axis_test_slew_deg_s * dt;
+            double current = e.mp6.axis_test_offset_deg[i];
+            current += std::clamp(goal - current, -step, step);
+            const double requested_abs = rt.neutral_crank_rad[i] + current * 3.14159265358979323846 / 180.0;
+            const double limited_abs = std::clamp(requested_abs, rt.min_rad, rt.max_rad);
+            current = (limited_abs - rt.neutral_crank_rad[i]) * 180.0 / 3.14159265358979323846;
+            e.mp6.axis_test_offset_deg[i] = (float)current;
+            e.mp6.axis_test_offset_steps[i] = mp6::mp6_net_round(
+                current * 3.14159265358979323846 / 180.0 * rt.angle_to_step[i]);
+            e.mp6.axis_test_target_steps[i] = rt.neutral_steps[i] + e.mp6.axis_test_offset_steps[i];
+            if (std::abs(current) > 1e-6 || std::abs(goal - current) > 1e-6) returned = false;
+        }
+        if (rt.axis_test_entering && entered) rt.axis_test_entry_waiting_tx = true;
+        if (rt.axis_test_returning && returned) rt.axis_test_return_waiting_tx = true;
+    }
     if ((s.state() == mp6::State::Running || s.state() == mp6::State::Parked)
-        && e.mp6.step_target_valid
+        && (axis_override || e.mp6.step_target_valid)
         && !e.mp6.estop_latched && !e.mp6.fault_latched) {
         mp6::StepTarget t;
         double blend = 1.0;
+        const bool blending = rt.start_blend_active;
         if (rt.start_blend_pending) blend = 0.0;
         else if (rt.start_blend_active) {
             blend = std::clamp((frame_time - rt.start_blend_begin) / START_RAMP_S, 0.0, 1.0);
@@ -2713,16 +2928,54 @@ void App::mp6UpdateEntity(Entity& e) {
             if (blend >= 1.0) rt.start_blend_active = false;
         }
         for (int i = 0; i < 6; i++)
-            t.steps[i] = mp6::roundHalfEvenToInt(rt.neutral_steps[i] + blend * (e.mp6.step_target[i] - rt.neutral_steps[i]));
+            t.steps[i] = axis_override ? e.mp6.axis_test_target_steps[i]
+                : mp6::roundHalfEvenToInt((blending ? rt.start_blend_start[i] : rt.neutral_steps[i]) +
+                    blend * (e.mp6.step_target[i] - (blending ? rt.start_blend_start[i] : rt.neutral_steps[i])));
+        for (int i = 0; i < 6; ++i) e.mp6.axis_test_target_steps[i] = t.steps[i];
         t.valid = true;
         t.generation = ++rt.target_gen;
         s.setTarget(t);
     }
 
+    const auto command2_before = s.txCounters().command2;
     s.tick((std::uint64_t)(frame_time * 1000.0));
+    if (s.txCounters().command2 != command2_before) {
+        rt.axis_test_last_sent_steps = s.target().steps;
+        rt.axis_test_last_sent_valid = true;
+        rt.axis_test_last_sent_time = frame_time;
+    }
+    if (rt.axis_test_entering && rt.axis_test_entry_waiting_tx && rt.axis_test_last_sent_steps == rt.neutral_steps) {
+        rt.axis_test_entering = false;
+        rt.axis_test_entry_waiting_tx = false;
+        e.mp6.axis_test_entering = false;
+        for (int i = 0; i < 6; ++i) e.mp6.axis_test_offset_deg[i] = 0.0f,
+            e.mp6.axis_test_offset_steps[i] = 0;
+    }
+    if (rt.axis_test_returning && rt.axis_test_return_waiting_tx && rt.axis_test_last_sent_steps == rt.neutral_steps) {
+        rt.axis_test_returning = false;
+        rt.axis_test_return_waiting_tx = false;
+        e.mp6.axis_test_returning = false;
+        rt.start_blend_start = rt.axis_test_last_sent_steps;
+        rt.start_blend_active = true;
+        rt.start_blend_begin = frame_time;
+    }
+    if (s.state() != mp6::State::Running && (e.mp6.axis_test_enabled || rt.axis_test_returning || rt.axis_test_entering)) {
+        e.mp6.axis_test_enabled = false;
+        e.mp6.axis_test_entering = false;
+        rt.axis_test_entering = false;
+        rt.axis_test_entry_waiting_tx = false;
+        rt.axis_test_returning = false;
+        rt.axis_test_return_waiting_tx = false;
+        e.mp6.axis_test_returning = false;
+        for (int i = 0; i < 6; ++i) {
+            e.mp6.axis_test_setpoint_deg[i] = e.mp6.axis_test_offset_deg[i] = 0.0f;
+            e.mp6.axis_test_offset_steps[i] = 0;
+        }
+    }
     if (rt.start_blend_pending && s.state() == mp6::State::Running) {
         rt.start_blend_pending = false;
         rt.start_blend_active = true;
+        rt.start_blend_start = rt.neutral_steps;
         rt.start_blend_begin = frame_time;
     }
 
@@ -2925,19 +3178,75 @@ static void mp6UpdatePipeline(App& app, Entity& e, const float scaled_pct[6]) {
                 e.mp6.viz.rod_top[i][2] = (float)targets[i][2];
                 e.mp6.viz.calc_residual_mm[i] = (float)res.axis[i].residual_mm;
                 e.mp6.viz.axis_ok[i] = res.axis[i].ok;
+                e.mp6.viz.measured_crank_valid[i] = false;
             }
             e.mp6.viz.rod_lines_valid = all_ok;
             // A target chain is only claimed fresh when every axis solved and
             // the post-cue pose was produced this very frame.
             e.mp6.step_target_valid = all_ok;
         } else {
+            e.mp6.viz.axis_test_active = false;
+            e.mp6.viz.axis_test_geometry_valid = false;
             e.mp6.viz.rod_lines_valid = false;
             e.mp6.step_target_valid = false;
             memset(e.mp6.step_target, 0, sizeof(e.mp6.step_target));
         }
     } else {
+        e.mp6.viz.axis_test_active = false;
+        e.mp6.viz.axis_test_geometry_valid = false;
         e.mp6.viz.rod_lines_valid = false;
     }
+}
+
+static void mp6UpdateAxisTestView(Entity& e) {
+    e.mp6.viz.axis_test_active = false;
+    e.mp6.viz.axis_test_geometry_valid = false;
+    for (int i = 0; i < 6; ++i) e.mp6.viz.measured_crank_valid[i] = false;
+    auto it = g_app.mp6_runtimes.find(e.id);
+    if (it == g_app.mp6_runtimes.end()) return;
+    App::Mp6Runtime& rt = *it->second;
+    const bool active = e.mp6.axis_test_enabled || e.mp6.axis_test_entering
+                     || e.mp6.axis_test_returning || rt.axis_test_entering
+                     || rt.axis_test_returning;
+    if (!active || !rt.session || rt.session->state() != mp6::State::Running
+        || !e.mp6.link_open || e.mp6.estop_latched || e.mp6.fault_latched) return;
+
+    e.mp6.viz.axis_test_active = true;
+    if (!rt.neutral_valid || !rt.solver_ready || rt.design.crank_length_mm <= 0.0
+        || rt.design.rod_length_mm <= 0.0) return;
+    auto neutral_tops = rt.geometry.top_attachment_mm;
+    mp6::mp6_transform_points(neutral_tops, mp6::Mp6Pose{}, rt.x_offset_mm, rt.z_offset_mm);
+    bool angle_data_valid = true;
+    for (int i = 0; i < 6; ++i) {
+        if (rt.angle_to_step[i] == 0.0) { angle_data_valid = false; break; }
+        const int32_t commanded_steps = rt.axis_test_last_sent_valid
+            ? rt.axis_test_last_sent_steps[i] : e.mp6.axis_test_target_steps[i];
+        const double commanded_angle = rt.neutral_crank_rad[i]
+            + (commanded_steps - rt.neutral_steps[i]) / rt.angle_to_step[i];
+        const auto commanded = mp6::Mp6CrankSolver::crank_joint_from_angle_aim(
+            rt.geometry, i, rt.design.crank_length_mm, commanded_angle);
+        double dx = commanded[0] - neutral_tops[i][0];
+        double dy = commanded[1] - neutral_tops[i][1];
+        double dz = commanded[2] - neutral_tops[i][2];
+        e.mp6.viz.axis_ok[i] = std::abs(std::sqrt(dx * dx + dy * dy + dz * dz)
+            - rt.design.rod_length_mm) <= 1.0;
+        for (int c = 0; c < 3; ++c) {
+            e.mp6.viz.crank_joint[i][c] = (float)commanded[c];
+            e.mp6.viz.rod_top[i][c] = (float)neutral_tops[i][c];
+            e.mp6.viz.axis_test_plate[i][c] = (float)neutral_tops[i][c];
+        }
+        if (e.mp6.feedback_valid && e.mp6.feedback_cal[i] != SHRT_MIN) {
+            const double measured_angle = rt.neutral_crank_rad[i]
+                + (e.mp6.feedback_cal[i] - rt.neutral_steps[i]) / rt.angle_to_step[i];
+            const auto measured = mp6::Mp6CrankSolver::crank_joint_from_angle_aim(
+                rt.geometry, i, rt.design.crank_length_mm, measured_angle);
+            for (int c = 0; c < 3; ++c)
+                e.mp6.viz.measured_crank_joint[i][c] = (float)measured[c];
+            e.mp6.viz.measured_crank_valid[i] = true;
+        }
+    }
+    e.mp6.viz.axis_test_geometry_valid = angle_data_valid;
+    e.mp6.viz.rod_lines_valid = angle_data_valid;
 }
 
 // ── Recording / Playback ────────────────────────────────────────────
@@ -4062,6 +4371,10 @@ skip_input_processing:
             }
             e.mp6.step_target_valid = false;
             mp6UpdateEntity(e);
+            e.mp6.viz.axis_test_active = false;
+            e.mp6.viz.axis_test_geometry_valid = false;
+            e.mp6.viz.rod_lines_valid = false;
+            for (int i = 0; i < 6; ++i) e.mp6.viz.measured_crank_valid[i] = false;
         }
     }
 
@@ -4188,6 +4501,7 @@ skip_input_processing:
             e.rate_ik_hz = 0.0f;
             e.rate_tel_hz = 0.0f;
             mp6UpdateEntity(e);   // dispatch staged intents + tick + mirror
+            mp6UpdateAxisTestView(e);
         } else if (e.type == EntityType::HIL) {
             // ── HIL auto-reconnect ──
             // Detect lost connection

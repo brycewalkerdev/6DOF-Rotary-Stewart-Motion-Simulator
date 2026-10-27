@@ -384,6 +384,23 @@ def stewart_mp6_command(entity: int, intent: str) -> dict:
 
 
 @mcp.tool()
+def stewart_mp6_axis_test(
+    entity: int | None = None, enable: bool | None = None,
+    axis: int | None = None, offset_deg: float | None = None,
+    cap_deg: float | None = None, slew_deg_s: float | None = None,
+    neutral_all: bool | None = None,
+) -> dict:
+    """Set guarded MP6 commissioning axis targets; requires Running after start blend."""
+    args = {} if entity is None else {"entity": entity}
+    for key, value in (("enable", enable), ("axis", axis), ("offset_deg", offset_deg),
+                       ("cap_deg", cap_deg), ("slew_deg_s", slew_deg_s),
+                       ("neutral_all", neutral_all)):
+        if value is not None:
+            args[key] = value
+    return _call("mp6_axis_test", args)
+
+
+@mcp.tool()
 def stewart_mp6_config_import(entity: int, text: str = "") -> dict:
     """Import (or clear with empty string) the PlatformConfig.pltc text.
 
