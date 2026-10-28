@@ -2,7 +2,9 @@
 
 This reference describes the implemented desktop and firmware boundaries. For
 setup, see [Build](BUILD.md); for target selection, see [Firmware](FIRMWARE.md).
-The [app guide](APP_GUIDE.md) documents the user interface.
+The [app guide](APP_GUIDE.md) documents the user interface. A system-level
+diagram is in [diagrams/architecture.drawio](diagrams/architecture.drawio)
+(open it in draw.io).
 
 ## Components and entry points
 
